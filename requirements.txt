@@ -1,0 +1,5 @@
+cryptography>=41.0
+requests>=2.31
+tqdm>=4.66
+huggingface_hub>=0.20
+gitpython>=3.1
