@@ -161,27 +161,24 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4, metavar="<n>",
                         help="Number of gunicorn worker processes (default: 4)")
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
 
     app = create_app(args.store, api_key=args.api_key)
 
-    try:
-        from gunicorn.app.base import BaseApplication
+    from gunicorn.app.base import BaseApplication
 
-        class _App(BaseApplication):
-            def load_config(self):
-                self.cfg.set("bind", f"{args.host}:{args.port}")
-                self.cfg.set("workers", args.workers)
+    class _App(BaseApplication):
+        def load_config(self):
+            self.cfg.set("bind", f"{args.host}:{args.port}")
+            self.cfg.set("workers", args.workers)
 
-            def load(self):
-                return app
+        def load(self):
+            return app
 
-        print(f"Starting innout-server on {args.host}:{args.port} "
-              f"(gunicorn, {args.workers} workers), store={args.store}")
-        _App().run()
-    except ImportError:
-        print(f"Starting innout-server on {args.host}:{args.port} "
-              f"(dev server), store={args.store}")
-        app.run(host=args.host, port=args.port)
+    print(f"Starting innout-server on {args.host}:{args.port} "
+          f"(gunicorn, {args.workers} workers), store={args.store}")
+    _App().run()
 
 
 if __name__ == "__main__":
