@@ -30,6 +30,7 @@ import argparse
 import hmac
 import os
 import re
+import uuid
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file, abort
@@ -49,7 +50,10 @@ _MAX_CHUNK_BYTES = 2 * 1024 * 1024 * 1024
 def _validate_session_id(value: str | None) -> str:
     if not value or not _UUID_RE.match(value):
         abort(400, "session_id must be a UUID")
-    return value
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        abort(400, "session_id must be a UUID")
 
 
 def _validate_part(value: str | None) -> str:
@@ -68,6 +72,13 @@ def _validate_total_parts(value: str | None) -> int:
     if total_parts <= 0:
         abort(400, "total_parts must be > 0")
     return total_parts
+
+
+def _session_dir(store: Path, session_id: str) -> Path:
+    session_dir = (store / uuid.UUID(session_id).hex).resolve()
+    if not session_dir.is_relative_to(store.resolve()):
+        abort(400, "Invalid session path")
+    return session_dir
 
 
 def create_app(
@@ -134,14 +145,14 @@ def create_app(
         if "file" not in request.files:
             abort(400, "Missing file field")
 
-        session_dir = store / session_id
+        session_dir = _session_dir(store, session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
-        total_parts_file = session_dir / "_total_parts"
+        total_parts_file = session_dir / "total_parts.txt"
         if total_parts_file.exists():
             try:
                 existing_total_parts = int(total_parts_file.read_text().strip())
             except ValueError:
-                abort(500, "Corrupt session metadata")
+                abort(500, "Session metadata corrupted: invalid total_parts value")
             if existing_total_parts != total_parts:
                 abort(400, "total_parts mismatch for session")
         else:
@@ -157,7 +168,7 @@ def create_app(
         _require_auth()
         session_id = _validate_session_id(session_id)
 
-        session_dir = store / session_id
+        session_dir = _session_dir(store, session_id)
         if not session_dir.is_dir():
             abort(404, "Session not found")
 
@@ -174,7 +185,7 @@ def create_app(
         session_id = _validate_session_id(session_id)
         part = _validate_part(part)
 
-        chunk = store / session_id / f"part{part}"
+        chunk = _session_dir(store, session_id) / f"part{part}"
         if not chunk.is_file():
             abort(404, "Chunk not found")
         return send_file(chunk, mimetype="application/octet-stream")
