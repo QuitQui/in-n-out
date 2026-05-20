@@ -17,13 +17,13 @@ def client(app):
     return app.test_client()
 
 
-def _upload(client, session_id: str, part: str, data: bytes):
+def _upload(client, session_id: str, part: str, data: bytes, total_parts: str = "1"):
     return client.post(
         "/upload",
         data={
             "session_id": session_id,
             "part": part,
-            "total_parts": "1",
+            "total_parts": total_parts,
             "file": (io.BytesIO(data), "chunk.bin"),
         },
         content_type="multipart/form-data",
@@ -72,10 +72,27 @@ def test_upload_missing_fields(client):
     assert resp.status_code == 400
 
 
+def test_upload_invalid_session_id(client):
+    resp = _upload(client, "not-a-uuid", "000", b"data")
+    assert resp.status_code == 400
+
+
+def test_upload_invalid_part(client):
+    sid = "44444444-4444-4444-4444-444444444444"
+    resp = _upload(client, sid, "99", b"data")
+    assert resp.status_code == 400
+
+
+def test_upload_part_out_of_range(client):
+    sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    resp = _upload(client, sid, "001", b"data", total_parts="1")
+    assert resp.status_code == 400
+
+
 def test_multiple_parts_manifest_sorted(client):
     sid = "55555555-5555-5555-5555-555555555555"
     for part in ["002", "000", "001"]:
-        _upload(client, sid, part, b"data")
+        _upload(client, sid, part, b"data", total_parts="3")
 
     manifest = client.get(f"/manifest/{sid}", headers=_AUTH).get_json()
     assert manifest["parts"] == ["000", "001", "002"]

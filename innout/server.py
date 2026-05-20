@@ -58,7 +58,23 @@ def _validate_part(value: str | None) -> str:
     return value
 
 
-def create_app(store_dir: str | Path, api_key: str | None = None) -> Flask:
+def _validate_total_parts(value: str | None) -> int:
+    if value is None:
+        abort(400, "Missing total_parts field")
+    try:
+        total_parts = int(value)
+    except ValueError:
+        abort(400, "total_parts must be an integer")
+    if total_parts <= 0:
+        abort(400, "total_parts must be > 0")
+    return total_parts
+
+
+def create_app(
+    store_dir: str | Path,
+    api_key: str | None = None,
+    limiter_storage_uri: str | None = None,
+) -> Flask:
     store = Path(store_dir)
     store.mkdir(parents=True, exist_ok=True)
 
@@ -76,7 +92,11 @@ def create_app(store_dir: str | Path, api_key: str | None = None) -> Flask:
         get_remote_address,
         app=app,
         default_limits=["200 per minute"],
-        storage_uri="memory://",
+        storage_uri=(
+            limiter_storage_uri
+            or os.environ.get("INNOUT_LIMITER_STORAGE_URI")
+            or "memory://"
+        ),
     )
 
     def _require_auth() -> None:
@@ -106,12 +126,26 @@ def create_app(store_dir: str | Path, api_key: str | None = None) -> Flask:
         _require_auth()
         session_id = _validate_session_id(request.form.get("session_id"))
         part = _validate_part(request.form.get("part"))
+        total_parts = _validate_total_parts(request.form.get("total_parts"))
+        part_index = int(part)
+        if part_index >= total_parts:
+            abort(400, "part is out of range for total_parts")
 
         if "file" not in request.files:
             abort(400, "Missing file field")
 
         session_dir = store / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
+        total_parts_file = session_dir / "_total_parts"
+        if total_parts_file.exists():
+            try:
+                existing_total_parts = int(total_parts_file.read_text().strip())
+            except ValueError:
+                abort(500, "Corrupt session metadata")
+            if existing_total_parts != total_parts:
+                abort(400, "total_parts mismatch for session")
+        else:
+            total_parts_file.write_text(str(total_parts))
 
         dest = session_dir / f"part{part}"
         request.files["file"].save(dest)
@@ -158,9 +192,19 @@ def main() -> None:
                         help="Host to bind to (default: 0.0.0.0)")
     parser.add_argument("--api-key", default=None, metavar="<key>",
                         help="API key (overrides INNOUT_API_KEY env var)")
+    parser.add_argument(
+        "--rate-limit-storage-uri",
+        default=None,
+        metavar="<uri>",
+        help="Flask-Limiter storage URI (overrides INNOUT_LIMITER_STORAGE_URI env var)",
+    )
     args = parser.parse_args()
 
-    app = create_app(args.store, api_key=args.api_key)
+    app = create_app(
+        args.store,
+        api_key=args.api_key,
+        limiter_storage_uri=args.rate_limit_storage_uri,
+    )
     print(f"Starting innout-server on {args.host}:{args.port}, store={args.store}")
     app.run(host=args.host, port=args.port)
 

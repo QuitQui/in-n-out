@@ -21,7 +21,7 @@ innout pull 41825928-771f-4e21-ad46-4fa6eb79b202 \
 
 | Step | Tool | Detail |
 |------|------|--------|
-| Acquire | `sources.py` | URL download, local path, GitHub clone, HuggingFace snapshot |
+| Acquire | `sources.py` | URL download, local path, GitHub clone, Hugging Face snapshot |
 | Encrypt | `crypto.py` | AES-256-GCM, PBKDF2-HMAC-SHA256 (100k iterations), random salt+nonce per file |
 | Split | `splitter.py` | Fixed-size binary chunks, zero-padded part numbers (`000`, `001`, …) |
 | Upload | `uploader.py` | Multipart POST with retry and tqdm progress |
@@ -67,6 +67,7 @@ Options:
 --port  <n>     Port to listen on (default: 8000)
 --host  <addr>  Bind address (default: 0.0.0.0)
 --api-key <key> Override INNOUT_API_KEY env var
+--rate-limit-storage-uri <uri> Override INNOUT_LIMITER_STORAGE_URI env var (default: memory://)
 ```
 
 The server enforces:
@@ -97,7 +98,7 @@ Source options (pick one):
 | `--url <url>` | Download from a remote URL |
 | `--local <path>` | Local file or directory (directories are tar.gz'd) |
 | `--github owner/repo[@branch]` | Clone a GitHub repo |
-| `--hf org/model` | HuggingFace snapshot |
+| `--hf org/model` | Hugging Face snapshot |
 
 If `--passphrase` is omitted, checks `INNOUT_PASSPHRASE` env var, then prompts interactively.
 If `--api-key` is omitted, checks `INNOUT_API_KEY` env var.
@@ -140,7 +141,7 @@ uv run python -m innout.cli push \
   --url http://cs231n.stanford.edu/tiny-imagenet-200.zip \
   --server http://localhost:8765 \
   --passphrase "my-passphrase" \
-  --api-key demo-key-change-me \
+  --api-key "$INNOUT_API_KEY" \
   --chunk-size 50
 
 # Done. Session ID: 41825928-771f-4e21-ad46-4fa6eb79b202  Parts: 5
@@ -149,7 +150,7 @@ uv run python -m innout.cli push \
 **Check the manifest:**
 
 ```bash
-curl -s -H "Authorization: Bearer demo-key-change-me" \
+curl -s -H "Authorization: Bearer $INNOUT_API_KEY" \
   http://localhost:8765/manifest/41825928-771f-4e21-ad46-4fa6eb79b202 | python3 -m json.tool
 
 {
@@ -165,7 +166,7 @@ uv run python -m innout.cli pull \
   41825928-771f-4e21-ad46-4fa6eb79b202 \
   --server http://localhost:8765 \
   --passphrase "my-passphrase" \
-  --api-key demo-key-change-me \
+  --api-key "$INNOUT_API_KEY" \
   --output ./recovered
 
 # Done. Output: ./recovered/result
