@@ -21,7 +21,7 @@ innout pull 41825928-771f-4e21-ad46-4fa6eb79b202 \
 
 | Step | Tool | Detail |
 |------|------|--------|
-| Acquire | `sources.py` | URL download, local path, GitHub clone, HuggingFace snapshot |
+| Acquire | `sources.py` | URL download, local path, GitHub clone, Hugging Face snapshot |
 | Encrypt | `crypto.py` | AES-256-GCM, PBKDF2-HMAC-SHA256 (100k iterations), random salt+nonce per file |
 | Split | `splitter.py` | Fixed-size binary chunks, zero-padded part numbers (`000`, `001`, …) |
 | Upload | `uploader.py` | Multipart POST with retry and tqdm progress |
@@ -67,6 +67,7 @@ Options:
 --port  <n>     Port to listen on (default: 8000)
 --host  <addr>  Bind address (default: 0.0.0.0)
 --api-key <key> Override INNOUT_API_KEY env var
+--rate-limit-storage-uri <uri> Override INNOUT_LIMITER_STORAGE_URI env var (default: memory://)
 ```
 
 The server enforces:
@@ -97,7 +98,7 @@ Source options (pick one):
 | `--url <url>` | Download from a remote URL |
 | `--local <path>` | Local file or directory (directories are tar.gz'd) |
 | `--github owner/repo[@branch]` | Clone a GitHub repo |
-| `--hf org/model` | HuggingFace snapshot |
+| `--hf org/model` | Hugging Face snapshot |
 
 If `--passphrase` is omitted, checks `INNOUT_PASSPHRASE` env var, then prompts interactively.
 If `--api-key` is omitted, checks `INNOUT_API_KEY` env var.
@@ -129,9 +130,11 @@ Downloads all parts for the session, joins them, decrypts, and writes the result
 **Start the server:**
 
 ```bash
-export INNOUT_API_KEY="demo-key-change-me"
+export INNOUT_API_KEY="$(openssl rand -hex 32)"
 uv run innout-server --store /tmp/innout-store --port 8765
 ```
+(If `openssl` is unavailable, generate a key with Python: `python3 -c "import secrets; print(secrets.token_hex(32))"`.)
+Verify the key length is 64 characters: `python3 -c "import os; print(len(os.environ.get('INNOUT_API_KEY','')))"`.
 
 **Push:**
 
@@ -140,7 +143,7 @@ uv run python -m innout.cli push \
   --url http://cs231n.stanford.edu/tiny-imagenet-200.zip \
   --server http://localhost:8765 \
   --passphrase "my-passphrase" \
-  --api-key demo-key-change-me \
+  --api-key "$INNOUT_API_KEY" \
   --chunk-size 50
 
 # Done. Session ID: 41825928-771f-4e21-ad46-4fa6eb79b202  Parts: 5
@@ -149,14 +152,35 @@ uv run python -m innout.cli push \
 **Check the manifest:**
 
 ```bash
-curl -s -H "Authorization: Bearer demo-key-change-me" \
-  http://localhost:8765/manifest/41825928-771f-4e21-ad46-4fa6eb79b202 | python3 -m json.tool
+# Run an inline Python script to fetch and print the manifest JSON.
+python3 - <<'PY'
+import json
+import os
+import uuid
+import requests
 
-{
-    "session_id": "41825928-771f-4e21-ad46-4fa6eb79b202",
-    "parts": ["000", "001", "002", "003", "004"]
-}
+api_key = os.environ.get("INNOUT_API_KEY")
+if not api_key or not api_key.strip():
+    raise SystemExit("INNOUT_API_KEY is not set")
+
+session_id = os.environ.get("INNOUT_SESSION_ID")
+if not session_id or not session_id.strip():
+    raise SystemExit("Set INNOUT_SESSION_ID to the Session ID printed by `push`")
+try:
+    session_id = str(uuid.UUID(session_id))
+except ValueError as exc:
+    raise SystemExit("INNOUT_SESSION_ID must be a UUID") from exc
+url = f"http://localhost:8765/manifest/{session_id}"
+resp = requests.get(
+    url,
+    headers={"Authorization": f"Bearer {api_key}"},
+    timeout=10,
+)
+resp.raise_for_status()
+print(json.dumps(resp.json(), indent=2))
+PY
 ```
+(`requests` is already installed with `uv sync` from this project.)
 
 **Pull and recover:**
 
@@ -165,7 +189,7 @@ uv run python -m innout.cli pull \
   41825928-771f-4e21-ad46-4fa6eb79b202 \
   --server http://localhost:8765 \
   --passphrase "my-passphrase" \
-  --api-key demo-key-change-me \
+  --api-key "$INNOUT_API_KEY" \
   --output ./recovered
 
 # Done. Output: ./recovered/result
