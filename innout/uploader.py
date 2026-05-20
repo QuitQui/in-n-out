@@ -1,5 +1,6 @@
 """Upload and download encrypted chunks to/from a self-hosted HTTP server."""
 
+import os
 import time
 from pathlib import Path
 
@@ -10,6 +11,15 @@ _CONNECT_TIMEOUT = 30       # seconds
 _READ_TIMEOUT = 300         # 5 minutes
 _MAX_RETRIES = 3
 _RETRY_SLEEP = 2            # seconds between retries
+
+
+def _auth_headers(api_key: str | None) -> dict[str, str]:
+    key = api_key or os.environ.get("INNOUT_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "API key required. Pass --api-key or set the INNOUT_API_KEY env var."
+        )
+    return {"Authorization": f"Bearer {key}"}
 
 
 class _ProgressReader:
@@ -30,6 +40,7 @@ def upload_chunks(
     chunks: list[Path],
     server_url: str,
     session_id: str,
+    api_key: str | None = None,
 ) -> None:
     """Upload each chunk via multipart POST to {server_url}/upload.
 
@@ -43,6 +54,7 @@ def upload_chunks(
     Retries each chunk up to 3 times on HTTP error before raising.
     """
     url = f"{server_url.rstrip('/')}/upload"
+    headers = _auth_headers(api_key)
     total_parts = len(chunks)
 
     for idx, chunk_path in enumerate(chunks):
@@ -74,6 +86,7 @@ def upload_chunks(
                             url,
                             files=files,
                             data=data,
+                            headers=headers,
                             timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
                         )
 
@@ -98,6 +111,7 @@ def download_chunks(
     server_url: str,
     session_id: str,
     output_dir: Path,
+    api_key: str | None = None,
 ) -> list[Path]:
     """Download all chunks for session_id from the server.
 
@@ -111,12 +125,14 @@ def download_chunks(
     Returns list of downloaded Paths sorted by part number.
     """
     base = server_url.rstrip("/")
+    headers = _auth_headers(api_key)
 
     # Fetch manifest
     manifest_url = f"{base}/manifest/{session_id}"
     try:
         manifest_resp = requests.get(
             manifest_url,
+            headers=headers,
             timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
         )
     except requests.RequestException as exc:
@@ -146,6 +162,7 @@ def download_chunks(
             try:
                 with requests.get(
                     download_url,
+                    headers=headers,
                     stream=True,
                     timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
                 ) as resp:

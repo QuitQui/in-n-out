@@ -45,7 +45,7 @@ def cmd_push(args: argparse.Namespace) -> None:
         session_id = str(uuid.uuid4())
         crypto.encrypt_stream(src_path, Path(tmpdir) / "encrypted", passphrase)
         chunks = splitter.split_file(Path(tmpdir) / "encrypted", session_id, Path(tmpdir), chunk_size_bytes)
-        uploader.upload_chunks(chunks, server_url, session_id)
+        uploader.upload_chunks(chunks, server_url, session_id, api_key=args.api_key)
         print(f"Done. Session ID: {session_id}  Parts: {len(chunks)}")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -60,7 +60,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     tmpdir = tempfile.mkdtemp()
     try:
-        chunks = uploader.download_chunks(server_url, session_id, Path(tmpdir))
+        chunks = uploader.download_chunks(server_url, session_id, Path(tmpdir), api_key=args.api_key)
         chunks = sorted(chunks, key=lambda p: p.name)
         splitter.join_files(chunks, Path(tmpdir) / "encrypted")
         crypto.decrypt_stream(Path(tmpdir) / "encrypted", output_dir / "result", passphrase)
@@ -85,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_group.add_argument("--hf", metavar="org/model", help="HuggingFace model/dataset to push")
     push_parser.add_argument("--server", metavar="<url>", required=True, help="Server URL")
     push_parser.add_argument("--passphrase", metavar="<str>", default=None, help="Encryption passphrase")
+    push_parser.add_argument("--api-key", metavar="<key>", default=None, help="Server API key (overrides INNOUT_API_KEY env var)")
     push_parser.add_argument(
         "--chunk-size",
         metavar="<MB>",
@@ -99,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     pull_parser.add_argument("session_id", metavar="<session_id>", help="Session ID returned by push")
     pull_parser.add_argument("--server", metavar="<url>", required=True, help="Server URL")
     pull_parser.add_argument("--passphrase", metavar="<str>", default=None, help="Decryption passphrase")
+    pull_parser.add_argument("--api-key", metavar="<key>", default=None, help="Server API key (overrides INNOUT_API_KEY env var)")
     pull_parser.add_argument(
         "--output",
         metavar="<dir>",
