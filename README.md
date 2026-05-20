@@ -130,9 +130,11 @@ Downloads all parts for the session, joins them, decrypts, and writes the result
 **Start the server:**
 
 ```bash
-export INNOUT_API_KEY="demo-key-change-me"
+export INNOUT_API_KEY="$(openssl rand -hex 32)"
 uv run innout-server --store /tmp/innout-store --port 8765
 ```
+(If `openssl` is unavailable, generate a key with Python: `python3 -c "import secrets; print(secrets.token_hex(32))"`.)
+Verify the key length is 64 characters: `python3 -c "import os; print(len(os.environ.get('INNOUT_API_KEY','')))"`.
 
 **Push:**
 
@@ -150,14 +152,35 @@ uv run python -m innout.cli push \
 **Check the manifest:**
 
 ```bash
-curl -s -H "Authorization: Bearer $INNOUT_API_KEY" \
-  http://localhost:8765/manifest/41825928-771f-4e21-ad46-4fa6eb79b202 | python3 -m json.tool
+# Run an inline Python script to fetch and print the manifest JSON.
+python3 - <<'PY'
+import json
+import os
+import uuid
+import requests
 
-{
-    "session_id": "41825928-771f-4e21-ad46-4fa6eb79b202",
-    "parts": ["000", "001", "002", "003", "004"]
-}
+api_key = os.environ.get("INNOUT_API_KEY")
+if not api_key or not api_key.strip():
+    raise SystemExit("INNOUT_API_KEY is not set")
+
+session_id = os.environ.get("INNOUT_SESSION_ID")
+if not session_id or not session_id.strip():
+    raise SystemExit("Set INNOUT_SESSION_ID to the Session ID printed by `push`")
+try:
+    session_id = str(uuid.UUID(session_id))
+except ValueError as exc:
+    raise SystemExit("INNOUT_SESSION_ID must be a UUID") from exc
+url = f"http://localhost:8765/manifest/{session_id}"
+resp = requests.get(
+    url,
+    headers={"Authorization": f"Bearer {api_key}"},
+    timeout=10,
+)
+resp.raise_for_status()
+print(json.dumps(resp.json(), indent=2))
+PY
 ```
+(`requests` is already installed with `uv sync` from this project.)
 
 **Pull and recover:**
 
