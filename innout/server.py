@@ -203,6 +203,8 @@ def main() -> None:
                         help="Host to bind to (default: 0.0.0.0)")
     parser.add_argument("--api-key", default=None, metavar="<key>",
                         help="API key (overrides INNOUT_API_KEY env var)")
+    parser.add_argument("--workers", type=int, default=4, metavar="<n>",
+                        help="Number of gunicorn worker processes (default: 4)")
     parser.add_argument(
         "--rate-limit-storage-uri",
         default=None,
@@ -210,14 +212,28 @@ def main() -> None:
         help="Flask-Limiter storage URI (overrides INNOUT_LIMITER_STORAGE_URI env var)",
     )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
 
     app = create_app(
         args.store,
         api_key=args.api_key,
         limiter_storage_uri=args.rate_limit_storage_uri,
     )
-    print(f"Starting innout-server on {args.host}:{args.port}, store={args.store}")
-    app.run(host=args.host, port=args.port)
+
+    from gunicorn.app.base import BaseApplication
+
+    class _App(BaseApplication):
+        def load_config(self):
+            self.cfg.set("bind", f"{args.host}:{args.port}")
+            self.cfg.set("workers", args.workers)
+
+        def load(self):
+            return app
+
+    print(f"Starting innout-server on {args.host}:{args.port} "
+          f"(gunicorn, {args.workers} workers), store={args.store}")
+    _App().run()
 
 
 if __name__ == "__main__":
