@@ -30,6 +30,7 @@ import argparse
 import hmac
 import os
 import re
+import uuid
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file, abort
@@ -49,7 +50,10 @@ _MAX_CHUNK_BYTES = 2 * 1024 * 1024 * 1024
 def _validate_session_id(value: str | None) -> str:
     if not value or not _UUID_RE.match(value):
         abort(400, "session_id must be a UUID")
-    return value
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        abort(400, "session_id must be a UUID")
 
 
 def _validate_part(value: str | None) -> str:
@@ -58,7 +62,30 @@ def _validate_part(value: str | None) -> str:
     return value
 
 
-def create_app(store_dir: str | Path, api_key: str | None = None) -> Flask:
+def _validate_total_parts(value: str | None) -> int:
+    if value is None:
+        abort(400, "Missing total_parts field")
+    try:
+        total_parts = int(value)
+    except ValueError:
+        abort(400, "total_parts must be an integer")
+    if total_parts <= 0:
+        abort(400, "total_parts must be > 0")
+    return total_parts
+
+
+def _session_dir(store: Path, session_id: str) -> Path:
+    session_dir = (store / uuid.UUID(session_id).hex).resolve()
+    if not session_dir.is_relative_to(store.resolve()):
+        abort(400, "Invalid session path")
+    return session_dir
+
+
+def create_app(
+    store_dir: str | Path,
+    api_key: str | None = None,
+    limiter_storage_uri: str | None = None,
+) -> Flask:
     store = Path(store_dir)
     store.mkdir(parents=True, exist_ok=True)
 
@@ -76,7 +103,11 @@ def create_app(store_dir: str | Path, api_key: str | None = None) -> Flask:
         get_remote_address,
         app=app,
         default_limits=["200 per minute"],
-        storage_uri="memory://",
+        storage_uri=(
+            limiter_storage_uri
+            or os.environ.get("INNOUT_LIMITER_STORAGE_URI")
+            or "memory://"
+        ),
     )
 
     def _require_auth() -> None:
@@ -106,12 +137,26 @@ def create_app(store_dir: str | Path, api_key: str | None = None) -> Flask:
         _require_auth()
         session_id = _validate_session_id(request.form.get("session_id"))
         part = _validate_part(request.form.get("part"))
+        total_parts = _validate_total_parts(request.form.get("total_parts"))
+        part_index = int(part)
+        if part_index >= total_parts:
+            abort(400, "part is out of range for total_parts")
 
         if "file" not in request.files:
             abort(400, "Missing file field")
 
-        session_dir = store / session_id
+        session_dir = _session_dir(store, session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
+        total_parts_file = session_dir / "total_parts.txt"
+        if total_parts_file.exists():
+            try:
+                existing_total_parts = int(total_parts_file.read_text().strip())
+            except ValueError:
+                abort(500, "Session metadata corrupted: invalid total_parts value")
+            if existing_total_parts != total_parts:
+                abort(400, "total_parts mismatch for session")
+        else:
+            total_parts_file.write_text(str(total_parts))
 
         dest = session_dir / f"part{part}"
         request.files["file"].save(dest)
@@ -123,7 +168,7 @@ def create_app(store_dir: str | Path, api_key: str | None = None) -> Flask:
         _require_auth()
         session_id = _validate_session_id(session_id)
 
-        session_dir = store / session_id
+        session_dir = _session_dir(store, session_id)
         if not session_dir.is_dir():
             abort(404, "Session not found")
 
@@ -140,7 +185,7 @@ def create_app(store_dir: str | Path, api_key: str | None = None) -> Flask:
         session_id = _validate_session_id(session_id)
         part = _validate_part(part)
 
-        chunk = store / session_id / f"part{part}"
+        chunk = _session_dir(store, session_id) / f"part{part}"
         if not chunk.is_file():
             abort(404, "Chunk not found")
         return send_file(chunk, mimetype="application/octet-stream")
@@ -160,28 +205,35 @@ def main() -> None:
                         help="API key (overrides INNOUT_API_KEY env var)")
     parser.add_argument("--workers", type=int, default=4, metavar="<n>",
                         help="Number of gunicorn worker processes (default: 4)")
+    parser.add_argument(
+        "--rate-limit-storage-uri",
+        default=None,
+        metavar="<uri>",
+        help="Flask-Limiter storage URI (overrides INNOUT_LIMITER_STORAGE_URI env var)",
+    )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
 
-    app = create_app(args.store, api_key=args.api_key)
+    app = create_app(
+        args.store,
+        api_key=args.api_key,
+        limiter_storage_uri=args.rate_limit_storage_uri,
+    )
 
-    try:
-        from gunicorn.app.base import BaseApplication
+    from gunicorn.app.base import BaseApplication
 
-        class _App(BaseApplication):
-            def load_config(self):
-                self.cfg.set("bind", f"{args.host}:{args.port}")
-                self.cfg.set("workers", args.workers)
+    class _App(BaseApplication):
+        def load_config(self):
+            self.cfg.set("bind", f"{args.host}:{args.port}")
+            self.cfg.set("workers", args.workers)
 
-            def load(self):
-                return app
+        def load(self):
+            return app
 
-        print(f"Starting innout-server on {args.host}:{args.port} "
-              f"(gunicorn, {args.workers} workers), store={args.store}")
-        _App().run()
-    except ImportError:
-        print(f"Starting innout-server on {args.host}:{args.port} "
-              f"(dev server), store={args.store}")
-        app.run(host=args.host, port=args.port)
+    print(f"Starting innout-server on {args.host}:{args.port} "
+          f"(gunicorn, {args.workers} workers), store={args.store}")
+    _App().run()
 
 
 if __name__ == "__main__":
