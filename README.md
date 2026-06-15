@@ -84,8 +84,10 @@ To host publicly, put it behind nginx or Caddy with TLS. The Flask dev server is
 
 ```bash
 innout push [source] \
-  --server <url> \
+  --server <url>            # custom server, OR
+  --drive <folder>          # Google Drive folder name
   [--passphrase <str>] \
+  [--credentials <path>] \
   [--api-key <key>] \
   [--chunk-size <MB>]
 ```
@@ -104,11 +106,26 @@ If `--api-key` is omitted, checks `INNOUT_API_KEY` env var.
 
 `--chunk-size` defaults to 1800 MB. Tune it to stay under your server's upload limits.
 
-On success, prints the session ID — save it, you need it to pull.
+### Push to Google Drive
+
+```bash
+innout push --local ./my-project \
+  --drive "my-backup-folder" \
+  --credentials credentials.json \
+  --passphrase "correct horse battery"
+# Done. Session ID: ...  Parts: 3
+# Drive folder: https://drive.google.com/drive/folders/...
+```
+
+`--credentials` defaults to `credentials.json` in the current directory. Download it from Google Cloud Console → APIs & Services → OAuth 2.0 Client IDs. On first run, a browser window opens for OAuth consent; the token is cached at `~/.innout_drive_token.json` for future runs.
+
+On success, prints the session ID and the Drive folder URL — save both.
 
 ---
 
 ## Pull
+
+### Pull from custom server
 
 ```bash
 innout pull <session_id> \
@@ -118,7 +135,36 @@ innout pull <session_id> \
   [--output <dir>]
 ```
 
-Downloads all parts for the session, joins them, decrypts, and writes the result to `<output>/result`. If the original source was a directory, `result` is a `.tar.gz` archive — unpack it with `tar xzf`.
+Downloads all parts for the session, joins them, decrypts, and writes the result to `<output>/result`.
+
+### Pull from Google Drive
+
+```bash
+innout pull \
+  --drive "my-backup-folder" \
+  --credentials credentials.json \
+  --passphrase "correct horse battery" \
+  --output ./recovered
+# Done. Output: ./recovered/result
+```
+
+`--drive` and `--server` are mutually exclusive. The Drive folder name must match the one used during `push`.
+
+### Pull from a manually downloaded directory
+
+If you downloaded the chunk files by hand (e.g. via the Drive web UI), point `--from-dir` at the local folder:
+
+```bash
+innout pull \
+  --from-dir ./downloaded-chunks \
+  --passphrase "correct horse battery" \
+  --output ./recovered
+# Done. Output: ./recovered/result
+```
+
+Chunk files must match the pattern `*.part???` (e.g. `session.part000`, `session.part001`).
+
+If the original source was a directory, `result` is a `.tar.gz` archive — unpack it with `tar xzf`.
 
 ---
 
