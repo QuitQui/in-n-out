@@ -14,7 +14,5 @@ reviews:
   tools:
     gitleaks:
       enabled: true           # secret scanning on every PR
-    ruff:
-      enabled: true           # this repo is Python
 chat:
-  auto_reply: true
+  auto_reply: false           # require explicit @coderabbitai mention
