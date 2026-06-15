@@ -16,3 +16,6 @@ client_secret*.json
 *.key
 .env
 .env.*
+# ...but keep committed templates
+!.env.example
+!.env.sample
