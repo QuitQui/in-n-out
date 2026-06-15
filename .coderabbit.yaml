@@ -1,0 +1,20 @@
+# CodeRabbit configuration — https://docs.coderabbit.ai/guides/configure-coderabbit
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+reviews:
+  profile: assertive          # thorough, security-leaning reviews
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+  tools:
+    gitleaks:
+      enabled: true           # secret scanning on every PR
+    ruff:
+      enabled: true           # this repo is Python
+chat:
+  auto_reply: true
