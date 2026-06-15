@@ -35,9 +35,10 @@ jobs:
           # Must be a real PR (issue_comment also fires on plain issues)
           if ! gh pr view "${PR_NUM}" --json number >/dev/null 2>&1; then
             echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-          # Skip the bots' own activity
+          # Skip our own automation (Claude / Actions) but ALLOW CodeRabbit through —
+          # its review comments are exactly the signal that should wake Claude.
           case "${ACTOR}" in
-            claude*|github-actions*|*"[bot]") echo "run=false" >> "$GITHUB_OUTPUT"; exit 0;;
+            claude*|github-actions*) echo "run=false" >> "$GITHUB_OUTPUT"; exit 0;;
           esac
           # Require the auto-merge label
           if gh pr view "${PR_NUM}" --json labels -q '.labels[].name' | grep -Fxq 'auto-merge'; then
@@ -65,21 +66,25 @@ jobs:
             You are the autonomous PR pipeline for ${{ github.repository }}.
             Target PR: #${{ needs.guard.outputs.pr }}. Use the `gh` CLI for all GitHub actions.
 
-            ITERATION CAP (do this first):
-            - List PR comments and find the latest marker matching `<!-- claude-iter: N -->`.
-              If none exists, treat N as 0. This run is iteration N+1 (max 2).
+            STEP 1 — READINESS:
+            Check whether CodeRabbit has already reviewed this PR (a coderabbitai review or
+            actionable review comments exist). If it has NOT reviewed yet, STOP now: do not
+            merge and do not change the iteration marker — you'll be re-invoked when it comments.
 
-            WORK:
-            1. Read CodeRabbit's review comments on the PR. Identify only ACTIONABLE
-               suggestions (ignore summaries, praise, and already-resolved threads).
-            2. For each actionable item: make the change, commit, and push to the PR's
-               head branch. Reply in each thread (resolved, or a short technical reason
-               if you disagree). Never force-push. Never edit files under .github/workflows.
+            STEP 2 — ADDRESS COMMENTS:
+            Read CodeRabbit's ACTIONABLE comments (ignore summaries, praise, resolved threads).
+            For each: make the change, commit, push to the PR head branch, and reply in the
+            thread (resolve, or give a short technical reason if you disagree). Never force-push;
+            never edit files under .github/workflows.
+
+            STEP 3 — ITERATION MARKER:
+            Find the latest comment marker `<!-- claude-iter: N -->` (N=0 if none). This run is
+            iteration N+1 (max 2).
 
             GATE (evaluate after your changes):
-            - tests: run `gh pr checks ${{ needs.guard.outputs.pr }}`; the check named
-              "tests" must be success (not pending/failure).
-            - reviews: zero remaining unresolved actionable CodeRabbit comments.
+            - tests: `gh pr checks ${{ needs.guard.outputs.pr }}` shows the "tests" check is
+              success (not pending/failure).
+            - reviews: CodeRabbit has reviewed AND zero unresolved actionable CodeRabbit comments remain.
 
             DECISION:
             - If GATE passes: `gh pr merge ${{ needs.guard.outputs.pr }} --squash --delete-branch`. Stop.
