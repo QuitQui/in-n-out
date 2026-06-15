@@ -72,7 +72,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
         tmpdir = tempfile.mkdtemp()
         try:
             chunks = drive.download_from_drive(
-                args.drive, Path(tmpdir), getattr(args, "credentials", "credentials.json")
+                args.drive, Path(tmpdir), getattr(args, "credentials", None)
             )
             if not chunks:
                 raise SystemExit(f"error: no files found in Drive folder {args.drive!r}")
@@ -136,8 +136,8 @@ def build_parser() -> argparse.ArgumentParser:
     push_parser.add_argument(
         "--credentials",
         metavar="<path>",
-        default="credentials.json",
-        help="OAuth credentials JSON for Google Drive (default: credentials.json)",
+        default=None,
+        help="OAuth client-secrets JSON for Google Drive (default: $INNOUT_CREDENTIALS or ~/.innout_credentials.json)",
     )
     push_parser.add_argument("--passphrase", metavar="<str>", default=None, help="Encryption passphrase")
     push_parser.add_argument(
@@ -171,8 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
     pull_parser.add_argument(
         "--credentials",
         metavar="<path>",
-        default="credentials.json",
-        help="OAuth credentials JSON for Google Drive (default: credentials.json)",
+        default=None,
+        help="OAuth client-secrets JSON for Google Drive (default: $INNOUT_CREDENTIALS or ~/.innout_credentials.json)",
     )
     pull_parser.add_argument("--passphrase", metavar="<str>", default=None, help="Decryption passphrase")
     pull_parser.add_argument(
