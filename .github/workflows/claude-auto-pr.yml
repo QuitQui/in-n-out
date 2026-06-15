@@ -15,6 +15,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  id-token: write        # required by claude-code-action for OIDC token exchange
 
 jobs:
   guard:
