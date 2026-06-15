@@ -7,3 +7,12 @@ build/
 .venv/
 .DS_Store
 my-dataset/
+
+# Secrets / OAuth credentials — never commit these
+credentials.json
+token.json
+client_secret*.json
+*.pem
+*.key
+.env
+.env.*
