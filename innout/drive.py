@@ -12,6 +12,18 @@ _TOKEN_PATH = Path.home() / ".innout_drive_token.json"
 
 
 def _get_service(credentials_file: str):
+    """Build an authenticated Drive v3 service.
+
+    Caches the OAuth token at ``~/.innout_drive_token.json``. If the cached
+    refresh token has expired or been revoked (common with Google Cloud
+    "Testing" apps whose refresh tokens expire after 7 days), the stale
+    token is deleted and a fresh browser-based OAuth flow runs automatically.
+
+    To avoid re-auth entirely: publish the Cloud Console app (move it from
+    "Testing" to "Production" in the OAuth consent screen) — published apps
+    get long-lived refresh tokens.
+    """
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -22,9 +34,16 @@ def _get_service(credentials_file: str):
         creds = Credentials.from_authorized_user_file(str(_TOKEN_PATH), SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                print(f"[innout] Refresh token expired/revoked — "
+                      f"removing {_TOKEN_PATH} and re-authenticating.")
+                _TOKEN_PATH.unlink(missing_ok=True)
+                creds = None
+        if not creds or not creds.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                credentials_file, SCOPES)
             creds = flow.run_local_server(port=0)
         _TOKEN_PATH.write_text(creds.to_json())
 
