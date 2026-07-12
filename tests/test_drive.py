@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from innout import crypto, splitter
-from innout.drive import _get_or_create_folder, download_from_drive, upload_to_drive
+from innout.drive import (
+    _get_or_create_folder,
+    _resolve_credentials_path,
+    download_from_drive,
+    upload_to_drive,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -19,6 +24,29 @@ def _make_chunks(tmp: Path, content: bytes = b"hello world " * 100) -> list[Path
     src = tmp / "data.bin"
     src.write_bytes(content)
     return splitter.split_file(src, "test-session", tmp, chunk_size=50)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_credentials_path — keep credentials OUT of the repo
+# ---------------------------------------------------------------------------
+
+def test_resolve_credentials_explicit_path_wins(monkeypatch):
+    monkeypatch.setenv("INNOUT_CREDENTIALS", "/from/env.json")
+    assert _resolve_credentials_path("/explicit/creds.json") == "/explicit/creds.json"
+
+
+def test_resolve_credentials_uses_env_var(monkeypatch):
+    monkeypatch.setenv("INNOUT_CREDENTIALS", "/home/me/.secrets/creds.json")
+    assert _resolve_credentials_path(None) == "/home/me/.secrets/creds.json"
+
+
+def test_resolve_credentials_defaults_outside_repo(monkeypatch):
+    monkeypatch.delenv("INNOUT_CREDENTIALS", raising=False)
+    resolved = Path(_resolve_credentials_path(None))
+    # Must live under $HOME, never as a repo-relative "credentials.json".
+    assert resolved == Path.home() / ".innout_credentials.json"
+    assert resolved.is_absolute()
+    assert resolved.name != "credentials.json" or resolved.parent == Path.home()
 
 
 # ---------------------------------------------------------------------------
@@ -248,31 +276,3 @@ def test_download_from_drive_returns_sorted(mock_get_service, tmp_path):
         files = download_from_drive("my-folder", tmp_path, credentials_file="fake.json")
 
     assert [f.name for f in files] == ["sess.part000", "sess.part001"]
-
-
-# --------------------------------------------------------- credentials fallback
-
-def test_resolve_credentials_prefers_explicit_existing(tmp_path):
-    from innout import drive
-
-    f = tmp_path / "c.json"
-    f.write_text("{}")
-    assert drive._resolve_credentials_path(str(f)) == str(f)
-
-
-def test_resolve_credentials_falls_back_to_home(tmp_path, monkeypatch):
-    from innout import drive
-
-    home_creds = tmp_path / ".innout_credentials.json"
-    home_creds.write_text("{}")
-    monkeypatch.setattr(drive, "_HOME_CREDENTIALS", home_creds)
-    result = drive._resolve_credentials_path(str(tmp_path / "missing.json"))
-    assert result == str(home_creds)
-
-
-def test_resolve_credentials_returns_original_when_nothing_exists(tmp_path, monkeypatch):
-    from innout import drive
-
-    monkeypatch.setattr(drive, "_HOME_CREDENTIALS", tmp_path / "nope.json")
-    p = str(tmp_path / "missing.json")
-    assert drive._resolve_credentials_path(p) == p

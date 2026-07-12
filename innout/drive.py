@@ -3,30 +3,27 @@
 from __future__ import annotations
 
 import io
+import os
 from pathlib import Path
 
 from tqdm import tqdm
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 _TOKEN_PATH = Path.home() / ".innout_drive_token.json"
-_HOME_CREDENTIALS = Path.home() / ".innout_credentials.json"
+# Default location of the OAuth client-secrets file. Resolved OUTSIDE the repo
+# so credentials never sit inside the (now public) project folder: an explicit
+# path wins, then $INNOUT_CREDENTIALS, then a dotfile in $HOME.
+_DEFAULT_CREDENTIALS_PATH = Path.home() / ".innout_credentials.json"
 
 
-def _resolve_credentials_path(credentials_file: str) -> str:
-    """Resolve the OAuth client-secrets path.
-
-    The repo is public, so credentials should live OUTSIDE it: if the given
-    path (typically the cwd-relative default ``credentials.json``) does not
-    exist but ``~/.innout_credentials.json`` does, fall back to the latter.
-    """
-    if Path(credentials_file).exists():
+def _resolve_credentials_path(credentials_file: str | None) -> str:
+    """Pick the OAuth client-secrets path, keeping it out of the repo by default."""
+    if credentials_file:
         return credentials_file
-    if _HOME_CREDENTIALS.exists():
-        return str(_HOME_CREDENTIALS)
-    return credentials_file
+    return os.environ.get("INNOUT_CREDENTIALS") or str(_DEFAULT_CREDENTIALS_PATH)
 
 
-def _get_service(credentials_file: str):
+def _get_service(credentials_file: str | None = None):
     """Build an authenticated Drive v3 service.
 
     Caches the OAuth token at ``~/.innout_drive_token.json``. If the cached
@@ -44,6 +41,7 @@ def _get_service(credentials_file: str):
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 
+    credentials_file = _resolve_credentials_path(credentials_file)
     creds = None
     if _TOKEN_PATH.exists():
         creds = Credentials.from_authorized_user_file(str(_TOKEN_PATH), SCOPES)
@@ -58,7 +56,7 @@ def _get_service(credentials_file: str):
                 creds = None
         if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(
-                _resolve_credentials_path(credentials_file), SCOPES)
+                credentials_file, SCOPES)
             creds = flow.run_local_server(port=0)
         _TOKEN_PATH.write_text(creds.to_json())
 
@@ -83,7 +81,7 @@ def _get_or_create_folder(service, folder_name: str) -> str:
 def upload_to_drive(
     chunks: list[Path],
     folder_name: str,
-    credentials_file: str = "credentials.json",
+    credentials_file: str | None = None,
 ) -> str:
     """Upload chunks to a Google Drive folder, returns the folder URL."""
     from googleapiclient.http import MediaFileUpload
@@ -104,7 +102,7 @@ def upload_to_drive(
 def download_from_drive(
     folder_name: str,
     dest_dir: Path,
-    credentials_file: str = "credentials.json",
+    credentials_file: str | None = None,
 ) -> list[Path]:
     """Download all chunk files from a Google Drive folder into dest_dir.
 

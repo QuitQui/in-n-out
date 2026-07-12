@@ -1,7 +1,5 @@
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 *.egg-info/
 .eggs/
 dist/
@@ -10,6 +8,14 @@ build/
 .DS_Store
 my-dataset/
 
-# OAuth secrets — never commit (public repo)
+# Secrets / OAuth credentials — never commit these
 credentials.json
 token.json
+client_secret*.json
+*.pem
+*.key
+.env
+.env.*
+# ...but keep committed templates
+!.env.example
+!.env.sample

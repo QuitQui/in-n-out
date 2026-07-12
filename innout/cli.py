@@ -47,17 +47,18 @@ def cmd_push(args: argparse.Namespace) -> None:
         )
         session_id = str(uuid.uuid4())
         crypto.encrypt_stream(src_path, Path(tmpdir) / "encrypted", passphrase)
-        chunks = splitter.split_file(
-            Path(tmpdir) / "encrypted", session_id, Path(tmpdir), chunk_size_bytes
-        )
-
+        chunks = splitter.split_file(Path(tmpdir) / "encrypted", session_id, Path(tmpdir), chunk_size_bytes)
         if args.drive:
             from innout import drive
+
             folder_url = drive.upload_to_drive(chunks, args.drive, args.credentials)
             print(f"Done. Session ID: {session_id}  Parts: {len(chunks)}")
             print(f"Drive folder: {folder_url}")
         else:
-            uploader.upload_chunks(chunks, args.server, session_id, api_key=args.api_key)
+            try:
+                uploader.upload_chunks(chunks, args.server, session_id, api_key=args.api_key)
+            except uploader.MissingAPIKeyError as exc:
+                raise SystemExit(str(exc)) from exc
             print(f"Done. Session ID: {session_id}  Parts: {len(chunks)}")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -73,7 +74,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
         tmpdir = tempfile.mkdtemp()
         try:
             chunks = drive.download_from_drive(
-                args.drive, Path(tmpdir), getattr(args, "credentials", "credentials.json")
+                args.drive, Path(tmpdir), getattr(args, "credentials", None)
             )
             if not chunks:
                 raise SystemExit(f"error: no files found in Drive folder {args.drive!r}")
@@ -101,9 +102,12 @@ def cmd_pull(args: argparse.Namespace) -> None:
             raise SystemExit("error: one of --server, --drive, or --from-dir is required")
         tmpdir = tempfile.mkdtemp()
         try:
-            chunks = uploader.download_chunks(
-                args.server, args.session_id, Path(tmpdir), api_key=args.api_key
-            )
+            try:
+                chunks = uploader.download_chunks(
+                    args.server, args.session_id, Path(tmpdir), api_key=args.api_key
+                )
+            except uploader.MissingAPIKeyError as exc:
+                raise SystemExit(str(exc)) from exc
             chunks = sorted(chunks, key=lambda p: p.name)
             splitter.join_files(chunks, Path(tmpdir) / "encrypted")
             crypto.decrypt_stream(
@@ -134,8 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
     push_parser.add_argument(
         "--credentials",
         metavar="<path>",
-        default="credentials.json",
-        help="OAuth credentials JSON for Google Drive (default: credentials.json)",
+        default=None,
+        help="OAuth client-secrets JSON for Google Drive (default: $INNOUT_CREDENTIALS or ~/.innout_credentials.json)",
     )
     push_parser.add_argument("--passphrase", metavar="<str>", default=None, help="Encryption passphrase")
     push_parser.add_argument(
@@ -177,8 +181,8 @@ def build_parser() -> argparse.ArgumentParser:
     pull_parser.add_argument(
         "--credentials",
         metavar="<path>",
-        default="credentials.json",
-        help="OAuth credentials JSON for Google Drive (default: credentials.json)",
+        default=None,
+        help="OAuth client-secrets JSON for Google Drive (default: $INNOUT_CREDENTIALS or ~/.innout_credentials.json)",
     )
     pull_parser.add_argument("--passphrase", metavar="<str>", default=None, help="Decryption passphrase")
     pull_parser.add_argument(

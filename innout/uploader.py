@@ -13,10 +13,14 @@ _MAX_RETRIES = 3
 _RETRY_SLEEP = 2            # seconds between retries
 
 
+class MissingAPIKeyError(RuntimeError):
+    """Raised when no API key is provided by flag or environment."""
+
+
 def _auth_headers(api_key: str | None) -> dict[str, str]:
     key = api_key or os.environ.get("INNOUT_API_KEY")
     if not key:
-        raise RuntimeError(
+        raise MissingAPIKeyError(
             "API key required. Pass --api-key or set the INNOUT_API_KEY env var."
         )
     return {"Authorization": f"Bearer {key}"}
