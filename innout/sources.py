@@ -8,22 +8,58 @@ from __future__ import annotations
 
 import subprocess
 import tarfile
+from fnmatch import fnmatch
 from pathlib import Path
 
 import requests
 from tqdm import tqdm
 
 
-def _tar_gz_dir(source_dir: Path, work_dir: Path) -> Path:
-    """Create a tar.gz archive of source_dir inside work_dir and return its path."""
+def _is_excluded(rel_path: Path, patterns: list[str]) -> bool:
+    """True if rel_path matches any exclude pattern.
+
+    A pattern matches if it glob-matches the full relative path, the file
+    name, or any single path component (so ``data`` skips a whole
+    directory tree).
+    """
+    for pat in patterns:
+        pat = pat.rstrip("/")
+        if fnmatch(rel_path.as_posix(), pat) or fnmatch(rel_path.name, pat):
+            return True
+        if any(fnmatch(part, pat) for part in rel_path.parts):
+            return True
+    return False
+
+
+def _tar_gz_dir(
+    source_dir: Path, work_dir: Path, excludes: list[str] | None = None
+) -> Path:
+    """Create a tar.gz archive of source_dir inside work_dir and return its path.
+
+    excludes: glob patterns; matching files/directories are left out of the
+    archive (directories are skipped whole, without recursing).
+    """
     archive_name = source_dir.name + ".tar.gz"
     archive_path = work_dir / archive_name
+    patterns = list(excludes or [])
+
+    def _filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        rel = Path(info.name).relative_to(source_dir.name)
+        if rel.parts and _is_excluded(rel, patterns):
+            return None
+        return info
+
     with tarfile.open(archive_path, "w:gz") as tar:
-        tar.add(source_dir, arcname=source_dir.name)
+        tar.add(source_dir, arcname=source_dir.name, filter=_filter)
     return archive_path
 
 
-def acquire(source_type: str, source: str, work_dir: Path) -> Path:
+def acquire(
+    source_type: str,
+    source: str,
+    work_dir: Path,
+    excludes: list[str] | None = None,
+) -> Path:
     """Download / copy / clone the source into work_dir and return the path
     to a single file (tar.gz for directories/repos, original file for URLs/local files).
 
@@ -43,11 +79,11 @@ def acquire(source_type: str, source: str, work_dir: Path) -> Path:
     if source_type == "url":
         return _acquire_url(source, work_dir)
     elif source_type == "local":
-        return _acquire_local(source, work_dir)
+        return _acquire_local(source, work_dir, excludes)
     elif source_type == "github":
-        return _acquire_github(source, work_dir)
+        return _acquire_github(source, work_dir, excludes)
     elif source_type == "hf":
-        return _acquire_hf(source, work_dir)
+        return _acquire_hf(source, work_dir, excludes)
     else:
         raise ValueError(
             f"Unknown source_type {source_type!r}. "
@@ -82,15 +118,19 @@ def _acquire_url(url: str, work_dir: Path) -> Path:
     return dest
 
 
-def _acquire_local(source: str, work_dir: Path) -> Path:
+def _acquire_local(
+    source: str, work_dir: Path, excludes: list[str] | None = None
+) -> Path:
     """Return the local path as-is for files, or tar.gz a directory."""
     path = Path(source)
     if path.is_dir():
-        return _tar_gz_dir(path, work_dir)
+        return _tar_gz_dir(path, work_dir, excludes)
     return path
 
 
-def _acquire_github(source: str, work_dir: Path) -> Path:
+def _acquire_github(
+    source: str, work_dir: Path, excludes: list[str] | None = None
+) -> Path:
     """Clone a GitHub repo (optionally at a branch) and return a tar.gz archive."""
     # Parse optional @branch suffix
     if "@" in source:
@@ -109,10 +149,12 @@ def _acquire_github(source: str, work_dir: Path) -> Path:
 
     subprocess.run(cmd, check=True)
 
-    return _tar_gz_dir(dest_dir, work_dir)
+    return _tar_gz_dir(dest_dir, work_dir, excludes)
 
 
-def _acquire_hf(source: str, work_dir: Path) -> Path:
+def _acquire_hf(
+    source: str, work_dir: Path, excludes: list[str] | None = None
+) -> Path:
     """Download a HuggingFace repo snapshot and return a tar.gz archive."""
     from huggingface_hub import snapshot_download  # type: ignore[import]
 
@@ -121,4 +163,4 @@ def _acquire_hf(source: str, work_dir: Path) -> Path:
 
     snapshot_download(repo_id=source, local_dir=str(local_dir))
 
-    return _tar_gz_dir(local_dir, work_dir)
+    return _tar_gz_dir(local_dir, work_dir, excludes)

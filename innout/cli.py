@@ -42,7 +42,9 @@ def cmd_push(args: argparse.Namespace) -> None:
 
     tmpdir = tempfile.mkdtemp()
     try:
-        src_path = sources.acquire(source_type, source, Path(tmpdir))
+        src_path = sources.acquire(
+            source_type, source, Path(tmpdir), excludes=args.exclude
+        )
         session_id = str(uuid.uuid4())
         crypto.encrypt_stream(src_path, Path(tmpdir) / "encrypted", passphrase)
         chunks = splitter.split_file(
@@ -146,6 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1800,
         help="Chunk size in MB (default: 1800)",
+    )
+    push_parser.add_argument(
+        "--exclude",
+        metavar="<pattern>",
+        action="append",
+        default=[],
+        help="Glob pattern to leave out of directory sources (repeatable), "
+             "e.g. --exclude '*.pt' --exclude data",
     )
     push_parser.set_defaults(func=cmd_push)
 
