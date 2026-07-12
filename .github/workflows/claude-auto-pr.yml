@@ -63,6 +63,14 @@ jobs:
           LINK_SLACK_WEBHOOK_URL: ${{ secrets.LINK_SLACK_WEBHOOK_URL }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_bots: "coderabbitai"
+          allowed_non_write_users: "coderabbitai"
+          # Without an explicit allowlist the in-action Claude gets every
+          # gh/git call permission-denied and exits "successfully" having
+          # done nothing (observed on JimChienTW/Claude PR #47).
+          claude_args: |
+            --allowedTools "Bash(gh:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git checkout:*),Bash(git fetch:*),Read,Write,Edit,Glob,Grep"
           prompt: |
             You are the autonomous PR pipeline for ${{ github.repository }}.
             Target PR: #${{ needs.guard.outputs.pr }}. Use the `gh` CLI for all GitHub actions.
