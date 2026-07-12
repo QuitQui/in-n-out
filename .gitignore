@@ -9,3 +9,7 @@ build/
 .venv/
 .DS_Store
 my-dataset/
+
+# OAuth secrets — never commit (public repo)
+credentials.json
+token.json
