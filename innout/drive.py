@@ -9,6 +9,21 @@ from tqdm import tqdm
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 _TOKEN_PATH = Path.home() / ".innout_drive_token.json"
+_HOME_CREDENTIALS = Path.home() / ".innout_credentials.json"
+
+
+def _resolve_credentials_path(credentials_file: str) -> str:
+    """Resolve the OAuth client-secrets path.
+
+    The repo is public, so credentials should live OUTSIDE it: if the given
+    path (typically the cwd-relative default ``credentials.json``) does not
+    exist but ``~/.innout_credentials.json`` does, fall back to the latter.
+    """
+    if Path(credentials_file).exists():
+        return credentials_file
+    if _HOME_CREDENTIALS.exists():
+        return str(_HOME_CREDENTIALS)
+    return credentials_file
 
 
 def _get_service(credentials_file: str):
@@ -43,7 +58,7 @@ def _get_service(credentials_file: str):
                 creds = None
         if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(
-                credentials_file, SCOPES)
+                _resolve_credentials_path(credentials_file), SCOPES)
             creds = flow.run_local_server(port=0)
         _TOKEN_PATH.write_text(creds.to_json())
 
