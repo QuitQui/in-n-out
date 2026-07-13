@@ -5,12 +5,15 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tqdm import tqdm
 
+if TYPE_CHECKING:
+    from googleapiclient.discovery import Resource
+
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 _TOKEN_PATH = Path.home() / ".innout_drive_token.json"
-
 # Default location of the OAuth client-secrets file. Resolved OUTSIDE the repo
 # so credentials never sit inside the (now public) project folder: an explicit
 # path wins, then $INNOUT_CREDENTIALS, then a dotfile in $HOME.
@@ -24,7 +27,19 @@ def _resolve_credentials_path(credentials_file: str | None) -> str:
     return os.environ.get("INNOUT_CREDENTIALS") or str(_DEFAULT_CREDENTIALS_PATH)
 
 
-def _get_service(credentials_file: str | None = None):
+def _get_service(credentials_file: str | None = None) -> Resource:
+    """Build an authenticated Drive v3 service.
+
+    Caches the OAuth token at ``~/.innout_drive_token.json``. If the cached
+    refresh token has expired or been revoked (common with Google Cloud
+    "Testing" apps whose refresh tokens expire after 7 days), the stale
+    token is deleted and a fresh browser-based OAuth flow runs automatically.
+
+    To avoid re-auth entirely: publish the Cloud Console app (move it from
+    "Testing" to "Production" in the OAuth consent screen) — published apps
+    get long-lived refresh tokens.
+    """
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -36,9 +51,22 @@ def _get_service(credentials_file: str | None = None):
         creds = Credentials.from_authorized_user_file(str(_TOKEN_PATH), SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
+            try:
+                creds.refresh(Request())
+            except RefreshError as exc:
+                # Only treat confirmed permanent OAuth failures (e.g. a revoked
+                # or expired refresh token) as a reason to force re-auth.
+                # Transient transport/network errors should propagate instead
+                # of silently discarding a still-valid cached token.
+                if "invalid_grant" not in str(exc):
+                    raise
+                print(f"[innout] Refresh token expired/revoked — "
+                      f"removing {_TOKEN_PATH} and re-authenticating.")
+                _TOKEN_PATH.unlink(missing_ok=True)
+                creds = None
+        if not creds or not creds.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                credentials_file, SCOPES)
             creds = flow.run_local_server(port=0)
         _TOKEN_PATH.write_text(creds.to_json())
 
