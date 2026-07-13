@@ -53,7 +53,13 @@ def _get_service(credentials_file: str | None = None) -> "Resource":
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
-            except RefreshError:
+            except RefreshError as exc:
+                # Only treat confirmed permanent OAuth failures (e.g. a revoked
+                # or expired refresh token) as a reason to force re-auth.
+                # Transient transport/network errors should propagate instead
+                # of silently discarding a still-valid cached token.
+                if "invalid_grant" not in str(exc):
+                    raise
                 print(f"[innout] Refresh token expired/revoked — "
                       f"removing {_TOKEN_PATH} and re-authenticating.")
                 _TOKEN_PATH.unlink(missing_ok=True)
