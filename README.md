@@ -162,6 +162,7 @@ innout pull \
   --passphrase "correct horse battery" \
   --output ./recovered
 # Done. Output: recovered/mydata.tar
+# Extract with: tar -xf "mydata.tar"
 ```
 
 Chunk files must match the pattern `*.part???` (e.g. `session.part000`, `session.part001`).

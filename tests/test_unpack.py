@@ -74,6 +74,18 @@ def test_unknown_bytes_stay_result(tmp_path):
     assert final.read_bytes() == b"just some plain file contents"
 
 
+def test_gzip_magic_false_positive_keeps_original(tmp_path):
+    blob = tmp_path / "decrypted"
+    blob.write_bytes(b"\x1f\x8b" + b"not really gzip data")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    final = unpack.finalize_output(blob, out_dir)
+
+    assert final == out_dir / "result"
+    assert final.read_bytes() == b"\x1f\x8b" + b"not really gzip data"
+
+
 def test_existing_output_not_clobbered(tmp_path):
     src = _make_source_dir(tmp_path)
     blob = tmp_path / "decrypted"
@@ -135,3 +147,4 @@ def test_cmd_pull_from_dir_emits_named_tar(tmp_path, capsys):
         assert "mydata/hello.txt" in tar.getnames()
     captured = capsys.readouterr()
     assert "mydata.tar" in captured.out
+    assert 'Extract with: tar -xf "mydata.tar"' in captured.out

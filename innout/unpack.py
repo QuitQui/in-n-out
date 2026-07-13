@@ -35,7 +35,13 @@ def _safe_top_name(tar_path: Path) -> str | None:
     # tar member names always use "/" separators, even for archives
     # created on Windows
     top = member.name.split("/")[0].strip()
-    if not top or top in {".", ".."} or "\\" in top or "\x00" in top:
+    if (
+        not top
+        or top in {".", ".."}
+        or "\\" in top
+        or "\x00" in top
+        or any(c in '<>:"|?*' for c in top)
+    ):
         return None
     return top
 
