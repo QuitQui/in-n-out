@@ -27,7 +27,7 @@ def _resolve_credentials_path(credentials_file: str | None) -> str:
     return os.environ.get("INNOUT_CREDENTIALS") or str(_DEFAULT_CREDENTIALS_PATH)
 
 
-def _get_service(credentials_file: str | None = None) -> "Resource":
+def _get_service(credentials_file: str | None = None) -> Resource:
     """Build an authenticated Drive v3 service.
 
     Caches the OAuth token at ``~/.innout_drive_token.json``. If the cached
