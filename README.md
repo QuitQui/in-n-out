@@ -136,7 +136,7 @@ innout pull <session_id> \
   [--output <dir>]
 ```
 
-Downloads all parts for the session, joins them, decrypts, and writes the result to `<output>/result`.
+Downloads all parts for the session, joins them, decrypts, and writes the output into `<output>/`. If the original source was a directory, you get `<name>.tar` directly (already decompressed) — one `tar -xf <name>.tar` away from the original folder on Windows 10+, Linux, and macOS. Single-file sources keep the name `result`.
 
 ### Pull from Google Drive
 
@@ -146,7 +146,8 @@ innout pull \
   --credentials credentials.json \
   --passphrase "correct horse battery" \
   --output ./recovered
-# Done. Output: ./recovered/result
+# Done. Output: recovered/my-backup-folder.tar
+# Extract with: tar -xf "my-backup-folder.tar"
 ```
 
 `--drive` and `--server` are mutually exclusive. The Drive folder name must match the one used during `push`.
@@ -160,12 +161,13 @@ innout pull \
   --from-dir ./downloaded-chunks \
   --passphrase "correct horse battery" \
   --output ./recovered
-# Done. Output: ./recovered/result
+# Done. Output: recovered/mydata.tar
+# Extract with: tar -xf "mydata.tar"
 ```
 
 Chunk files must match the pattern `*.part???` (e.g. `session.part000`, `session.part001`).
 
-If the original source was a directory, `result` is a `.tar.gz` archive — unpack it with `tar xzf`.
+If the original source was a directory, the output is `<name>.tar` (gzip already undone during pull) — a single `tar -xf` restores the folder, on Windows 10+ / Linux / macOS alike. Anything unrecognized falls back to the name `result`, and existing files are never overwritten (a `-1`, `-2`, … suffix is added instead).
 
 ---
 

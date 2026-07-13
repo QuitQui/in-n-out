@@ -6,7 +6,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from innout import crypto, sources, splitter, uploader
+from innout import crypto, sources, splitter, unpack, uploader
 
 
 def get_passphrase(args_passphrase: str | None) -> str:
@@ -64,6 +64,20 @@ def cmd_push(args: argparse.Namespace) -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _decrypt_and_finalize(tmpdir: Path, output_dir: Path, passphrase: str) -> None:
+    """Decrypt the joined blob and emit the friendliest output file.
+
+    Directories arrive as tar.gz; finalize_output decompresses once so the
+    user gets `<name>.tar` (single extraction on Windows and Linux) instead
+    of an opaque `result` file.
+    """
+    crypto.decrypt_stream(tmpdir / "encrypted", tmpdir / "decrypted", passphrase)
+    final = unpack.finalize_output(tmpdir / "decrypted", output_dir)
+    print(f"Done. Output: {final}")
+    if final.suffix == ".tar":
+        print(f'Extract with: tar -xf "{final.name}"')
+
+
 def cmd_pull(args: argparse.Namespace) -> None:
     output_dir = Path(args.output)
     passphrase = get_passphrase(args.passphrase)
@@ -79,8 +93,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
             if not chunks:
                 raise SystemExit(f"error: no files found in Drive folder {args.drive!r}")
             splitter.join_files(chunks, Path(tmpdir) / "encrypted")
-            crypto.decrypt_stream(Path(tmpdir) / "encrypted", output_dir / "result", passphrase)
-            print(f"Done. Output: {output_dir}/result")
+            _decrypt_and_finalize(Path(tmpdir), output_dir, passphrase)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
     elif args.from_dir:
@@ -91,8 +104,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
         tmpdir = tempfile.mkdtemp()
         try:
             splitter.join_files(chunks, Path(tmpdir) / "encrypted")
-            crypto.decrypt_stream(Path(tmpdir) / "encrypted", output_dir / "result", passphrase)
-            print(f"Done. Output: {output_dir}/result")
+            _decrypt_and_finalize(Path(tmpdir), output_dir, passphrase)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
     else:
@@ -110,10 +122,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
                 raise SystemExit(str(exc)) from exc
             chunks = sorted(chunks, key=lambda p: p.name)
             splitter.join_files(chunks, Path(tmpdir) / "encrypted")
-            crypto.decrypt_stream(
-                Path(tmpdir) / "encrypted", output_dir / "result", passphrase
-            )
-            print(f"Done. Output: {output_dir}/result")
+            _decrypt_and_finalize(Path(tmpdir), output_dir, passphrase)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
