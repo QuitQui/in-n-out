@@ -5,8 +5,12 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from googleapiclient.discovery import Resource
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 _TOKEN_PATH = Path.home() / ".innout_drive_token.json"
@@ -23,7 +27,7 @@ def _resolve_credentials_path(credentials_file: str | None) -> str:
     return os.environ.get("INNOUT_CREDENTIALS") or str(_DEFAULT_CREDENTIALS_PATH)
 
 
-def _get_service(credentials_file: str | None = None):
+def _get_service(credentials_file: str | None = None) -> "Resource":
     """Build an authenticated Drive v3 service.
 
     Caches the OAuth token at ``~/.innout_drive_token.json``. If the cached
