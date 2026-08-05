@@ -104,7 +104,9 @@ def upload_to_drive(
             str(chunk), mimetype="application/octet-stream", resumable=True
         )
         meta = {"name": chunk.name, "parents": [folder_id]}
-        service.files().create(body=meta, media_body=media, fields="id").execute()
+        service.files().create(
+            body=meta, media_body=media, fields="id"
+        ).execute(num_retries=10)
 
     return f"https://drive.google.com/drive/folders/{folder_id}"
 
@@ -150,7 +152,7 @@ def download_from_drive(
             downloader = MediaIoBaseDownload(fh, request)
             done = False
             while not done:
-                _, done = downloader.next_chunk()
+                _, done = downloader.next_chunk(num_retries=10)
         downloaded.append(dest_file)
 
     return sorted(downloaded, key=lambda p: p.name)

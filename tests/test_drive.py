@@ -106,6 +106,30 @@ def test_upload_to_drive_uploads_each_chunk(mock_get_service):
         shutil.rmtree(tmp)
 
 
+@patch("innout.drive._get_service")
+def test_upload_to_drive_retries_on_transient_failure(mock_get_service):
+    """A resumable upload must retry transient errors instead of failing outright.
+
+    Regression test: upload_to_drive used to call .execute() with no
+    num_retries, so a single transient SSLError/ConnectionError mid-upload
+    killed the whole (potentially 100+ MB) transfer with no retry at all.
+    """
+    service = MagicMock()
+    mock_get_service.return_value = service
+    service.files().list().execute.return_value = {"files": [{"id": "folder123"}]}
+    execute_mock = service.files().create.return_value.execute
+    execute_mock.return_value = {"id": "file1"}
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        chunks = _make_chunks(tmp)
+        upload_to_drive(chunks, "test-folder", credentials_file="fake.json")
+        for call in execute_mock.call_args_list:
+            assert call.kwargs.get("num_retries", 0) > 0
+    finally:
+        shutil.rmtree(tmp)
+
+
 # ---------------------------------------------------------------------------
 # pull --from-dir (cmd_pull with local chunks)
 # ---------------------------------------------------------------------------
@@ -245,6 +269,29 @@ def test_download_from_drive_downloads_all_files(mock_get_service, tmp_path):
     assert len(files) == 2
     assert call_count[0] == 2
     assert all(f.parent == tmp_path for f in files)
+
+
+@patch("innout.drive._get_service")
+def test_download_from_drive_retries_on_transient_failure(mock_get_service, tmp_path):
+    """Regression test: downloader.next_chunk() must pass num_retries too."""
+    service = MagicMock()
+    mock_get_service.return_value = service
+
+    folder_list = MagicMock()
+    folder_list.execute.return_value = {"files": [{"id": "fld", "name": "my-folder"}]}
+    file_list = MagicMock()
+    file_list.execute.return_value = {"files": [{"id": "f1", "name": "sess.part000"}]}
+    service.files().list.side_effect = [folder_list, file_list]
+
+    with patch("googleapiclient.http.MediaIoBaseDownload") as mock_dl_cls:
+        dl = MagicMock()
+        dl.next_chunk.return_value = (None, True)
+        mock_dl_cls.return_value = dl
+
+        download_from_drive("my-folder", tmp_path, credentials_file="fake.json")
+
+        for call in dl.next_chunk.call_args_list:
+            assert call.kwargs.get("num_retries", 0) > 0
 
 
 @patch("innout.drive._get_service")
