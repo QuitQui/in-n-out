@@ -24,6 +24,7 @@ dependencies = [
 [project.scripts]
 innout = "innout.cli:main"
 innout-server = "innout.server:main"
+innout-batch = "innout.batch:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

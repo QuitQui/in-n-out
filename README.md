@@ -161,7 +161,11 @@ innout pull \
 # Extract with: tar -xf "my-backup-folder.tar"
 ```
 
-`--drive` and `--server` are mutually exclusive. The Drive folder name must match the one used during `push`.
+`--drive` and `--server` are mutually exclusive. The Drive folder must match the one used during `push`.
+
+Nested paths work on both sides: `--drive "VideoMME-v2/videos-001"` creates (on push) or walks (on pull) each level, matching every folder *within its parent* rather than by name across the whole Drive.
+
+**One push per folder.** Pull joins every file it finds in the folder, so two sessions sharing a folder decrypt to garbage. Give each push its own leaf.
 
 ### Pull from a manually downloaded directory
 
@@ -179,6 +183,51 @@ innout pull \
 Chunk files must match the pattern `*.part???` (e.g. `session.part000`, `session.part001`).
 
 If the original source was a directory, the output is `<name>.tar` (gzip already undone during pull) — a single `tar -xf` restores the folder, on Windows 10+ / Linux / macOS alike. Anything unrecognized falls back to the name `result`, and existing files are never overwritten (a `-1`, `-2`, … suffix is added instead).
+
+---
+
+## Batch push: datasets too big for one pass
+
+`innout push --hf` needs the snapshot, its tar.gz, the ciphertext and the chunks on disk at once — roughly 4x the source. A 100 GB dataset therefore needs ~400 GB of free space. `innout-batch` walks the repo one file at a time instead, so peak disk stays near **2x the largest single file**, and it records progress so an interrupted run resumes.
+
+```bash
+# What would happen, and what it costs — no transfer.
+uv run python -m innout.batch plan --repo MME-Benchmarks/Video-MME-v2 --drive-parent VideoMME-v2
+#   41 leaf folder(s), 105.20 GB total
+#   largest single file 5.09 GB -> peak working disk about 10.2 GB
+```
+
+Files matched by `--split` (default `videos/*`) each get their own leaf folder; everything else is bundled into one `annotations` session, so small files don't each cost a folder:
+
+```
+My Drive/VideoMME-v2/
+├── annotations/     <- the 9 small files, as one tar.gz
+├── videos-001/
+├── videos-002/
+└── ... videos-040/
+```
+
+```bash
+# The passphrase comes only from the environment — never an argument,
+# which would leave it in shell history and in `ps` output.
+read -rs INNOUT_PASSPHRASE && export INNOUT_PASSPHRASE
+
+uv run python -m innout.batch push --repo MME-Benchmarks/Video-MME-v2 --drive-parent VideoMME-v2
+```
+
+Interrupt it and re-run the same command: already-pushed files are skipped. Progress lives in a ledger at `~/.innout_batches/<repo>.json`, written after each file, which maps Drive folders back to original filenames and records each file's sha256.
+
+**Keep the ledger and the passphrase.** The passphrase is never stored; without it the uploaded data cannot be decrypted.
+
+```bash
+uv run python -m innout.batch pull --repo MME-Benchmarks/Video-MME-v2 --output ./recovered
+# [ 1/41] VideoMME-v2/annotations -> <bundle:annotations>
+#     ok  sha256 verified -> annotations.tar  (extract with: tar -xf annotations.tar)
+# [ 2/41] VideoMME-v2/videos-001 -> videos/001.zip
+#     ok  sha256 verified -> recovered/videos/001.zip
+```
+
+`pull` restores the original filename and path — a plain `innout pull` of a single-file session would hand you an opaque `result` — and verifies each file's sha256 against the ledger, exiting non-zero on any mismatch. Files already present are skipped unless `--force`. `--only <repo-path>` fetches just one.
 
 ---
 

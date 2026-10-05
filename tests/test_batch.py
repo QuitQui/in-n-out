@@ -1,0 +1,607 @@
+"""Tests for batched HuggingFace -> Drive pushes."""
+
+import hashlib
+import json
+import shutil
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from innout import batch, crypto, splitter
+from innout.batch import (
+    assign_leaves,
+    build_parser,
+    bundle_key,
+    is_bundle_key,
+    leaf_name,
+    ledger_path,
+    load_ledger,
+    pending_entries,
+    push_one_file,
+    save_ledger,
+    select_files,
+    sha256_file,
+)
+
+VIDEO_MME_FILES = [
+    ".gitattributes",
+    "README.md",
+    "assets/logo.png",
+    "eval.yaml",
+    "subtitle.zip",
+    "test.parquet",
+    "videos/001.zip",
+    "videos/002.zip",
+    "videos/040.zip",
+]
+
+
+def _entry(**overrides) -> dict:
+    """A ledger entry with synthetic values; override what a test cares about."""
+    entry = {
+        "leaf": "P/videos-001",
+        "session_id": "00000000-0000-0000-0000-000000000000",
+        "sha256": "0" * 64,
+        "size": 1,
+        "parts": 1,
+        "folder_url": "https://drive.google.com/drive/folders/synthetic-id",
+        "original_name": "001.zip",
+        "pushed_at": "2026-10-05T07:31:04Z",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _stub_download(repo_id, repo_type, repo_path, dest):
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / Path(repo_path).name
+    path.write_bytes(b"synthetic payload ")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# leaf_name / assign_leaves
+# ---------------------------------------------------------------------------
+
+def test_leaf_name_flattens_path_and_drops_extension():
+    assert leaf_name("videos/001.zip") == "videos-001"
+    assert leaf_name("test.parquet") == "test"
+    assert leaf_name("a/b/c.tar.gz") == "a-b-c.tar"
+
+
+def test_leaf_name_keeps_dotless_names_intact():
+    """A path whose last segment has no extension must keep that segment."""
+    assert leaf_name("videos/001") == "videos-001"
+    assert leaf_name("README") == "README"
+
+
+def test_leaf_name_ignores_dots_in_parent_dirs():
+    """Only an extension on the final segment is stripped."""
+    assert leaf_name("v1.0/data") == "v1.0-data"
+
+
+def test_leaf_name_rejects_unusable_path():
+    with pytest.raises(ValueError, match="Cannot derive a folder name"):
+        leaf_name("/")
+
+
+def test_assign_leaves_nests_under_parent():
+    assert assign_leaves(["videos/001.zip", "videos/002.zip"], "VideoMME-v2") == {
+        "videos/001.zip": "VideoMME-v2/videos-001",
+        "videos/002.zip": "VideoMME-v2/videos-002",
+    }
+
+
+def test_assign_leaves_rejects_collisions():
+    """Two paths slugifying to one folder would silently corrupt both pushes."""
+    with pytest.raises(ValueError, match="collision"):
+        assign_leaves(["videos/001.zip", "videos-001.zip"], "parent")
+
+
+# ---------------------------------------------------------------------------
+# select_files
+# ---------------------------------------------------------------------------
+
+def test_select_files_splits_videos_bundles_the_rest():
+    split, bundled = select_files(VIDEO_MME_FILES, ["videos/*"])
+    assert split == ["videos/001.zip", "videos/002.zip", "videos/040.zip"]
+    assert bundled == [
+        ".gitattributes", "README.md", "assets/logo.png",
+        "eval.yaml", "subtitle.zip", "test.parquet",
+    ]
+
+
+def test_select_files_matches_full_path_not_prefix():
+    """'videos/*' must not match a top-level file that merely starts with it."""
+    split, bundled = select_files(["videos.txt", "videos/001.zip"], ["videos/*"])
+    assert split == ["videos/001.zip"]
+    assert bundled == ["videos.txt"]
+
+
+def test_select_files_is_sorted_for_resumable_ordering():
+    split, _ = select_files(["videos/003.zip", "videos/001.zip"], ["videos/*"])
+    assert split == ["videos/001.zip", "videos/003.zip"]
+
+
+def test_select_files_accepts_multiple_globs():
+    split, bundled = select_files(VIDEO_MME_FILES, ["videos/*", "*.parquet"])
+    assert "test.parquet" in split
+    assert "test.parquet" not in bundled
+
+
+def test_bundle_key_cannot_collide_with_a_repo_path():
+    key = bundle_key("annotations")
+    assert is_bundle_key(key)
+    assert not is_bundle_key("videos/001.zip")
+    # Angle brackets are not legal in HuggingFace filenames.
+    assert "<" in key and ">" in key
+
+
+# ---------------------------------------------------------------------------
+# Ledger
+# ---------------------------------------------------------------------------
+
+def test_ledger_path_slugifies_repo_id():
+    path = ledger_path("MME-Benchmarks/Video-MME-v2")
+    assert path.name == "MME-Benchmarks__Video-MME-v2.json"
+    assert path.parent == Path.home() / ".innout_batches"
+
+
+def test_ledger_path_explicit_wins(tmp_path):
+    explicit = tmp_path / "custom.json"
+    assert ledger_path("any/repo", str(explicit)) == explicit
+
+
+def test_load_ledger_missing_returns_empty(tmp_path):
+    assert load_ledger(tmp_path / "nope.json") == {}
+
+
+def test_save_ledger_round_trips(tmp_path):
+    path = tmp_path / "nested" / "led.json"
+    ledger = {
+        "repo_id": "org/name",
+        "created_at": "2026-10-05T07:31:04Z",
+        "entries": {"videos/001.zip": _entry()},
+    }
+    save_ledger(path, ledger)
+    assert load_ledger(path) == ledger
+
+
+def test_save_ledger_leaves_no_temp_file(tmp_path):
+    """The atomic write must not leave a .tmp file beside the ledger."""
+    path = tmp_path / "led.json"
+    save_ledger(path, {"entries": {}})
+    assert [p.name for p in tmp_path.iterdir()] == ["led.json"]
+
+
+def test_save_ledger_overwrites_atomically(tmp_path):
+    path = tmp_path / "led.json"
+    save_ledger(path, {"entries": {"a": 1}})
+    save_ledger(path, {"entries": {"a": 1, "b": 2}})
+    assert load_ledger(path)["entries"] == {"a": 1, "b": 2}
+
+
+def test_save_ledger_writes_valid_json_with_trailing_newline(tmp_path):
+    path = tmp_path / "led.json"
+    save_ledger(path, {"entries": {}})
+    text = path.read_text()
+    assert text.endswith("\n")
+    assert json.loads(text) == {"entries": {}}
+
+
+def test_pending_entries_skips_already_pushed():
+    targets = {
+        "videos/001.zip": "p/videos-001",
+        "videos/002.zip": "p/videos-002",
+        "videos/003.zip": "p/videos-003",
+    }
+    ledger = {"entries": {"videos/002.zip": _entry()}}
+    assert pending_entries(ledger, targets) == ["videos/001.zip", "videos/003.zip"]
+
+
+def test_pending_entries_empty_ledger_returns_all_sorted():
+    assert pending_entries({}, {"b": "p/b", "a": "p/a"}) == ["a", "b"]
+
+
+def test_pending_entries_all_done_returns_empty():
+    assert pending_entries({"entries": {"a": _entry()}}, {"a": "p/a"}) == []
+
+
+# ---------------------------------------------------------------------------
+# sha256_file
+# ---------------------------------------------------------------------------
+
+def test_sha256_file_matches_hashlib(tmp_path):
+    path = tmp_path / "blob.bin"
+    data = bytes(range(256)) * 5000  # larger than the read buffer
+    path.write_bytes(data)
+    assert sha256_file(path) == hashlib.sha256(data).hexdigest()
+
+
+def test_sha256_file_handles_empty_file(tmp_path):
+    path = tmp_path / "empty.bin"
+    path.write_bytes(b"")
+    assert sha256_file(path) == hashlib.sha256(b"").hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# push_one_file
+# ---------------------------------------------------------------------------
+
+def test_push_one_file_records_metadata_and_cleans_up(tmp_path):
+    src = tmp_path / "001.zip"
+    src.write_bytes(b"video bytes " * 1000)
+    work = tmp_path / "work"
+    work.mkdir()
+
+    with patch("innout.batch.drive.upload_to_drive") as mock_upload:
+        mock_upload.return_value = "https://drive.google.com/drive/folders/leaf-id"
+        entry = push_one_file(
+            src, "VideoMME-v2/videos-001", "pw", work,
+            chunk_size_mb=1, credentials=None,
+        )
+
+    assert entry["leaf"] == "VideoMME-v2/videos-001"
+    assert entry["size"] == src.stat().st_size
+    assert entry["sha256"] == sha256_file(src)
+    assert entry["original_name"] == "001.zip"
+    assert entry["parts"] >= 1
+    assert entry["folder_url"].endswith("leaf-id")
+    assert entry["pushed_at"].endswith("Z")
+    # Intermediates are deleted so a 40-file run never accumulates disk.
+    assert list(work.iterdir()) == [], f"work dir not clean: {list(work.iterdir())}"
+
+
+def test_push_one_file_uploads_to_the_requested_leaf(tmp_path):
+    src = tmp_path / "f.bin"
+    src.write_bytes(b"x" * 500)
+    work = tmp_path / "work"
+    work.mkdir()
+
+    with patch("innout.batch.drive.upload_to_drive") as mock_upload:
+        mock_upload.return_value = "url"
+        push_one_file(src, "Parent/leaf", "pw", work, 1, None)
+
+    assert mock_upload.call_args.args[1] == "Parent/leaf"
+
+
+def test_push_one_file_cleans_up_when_upload_fails(tmp_path):
+    """A failed upload must not strand gigabytes of chunks on disk."""
+    src = tmp_path / "f.bin"
+    src.write_bytes(b"x" * 500)
+    work = tmp_path / "work"
+    work.mkdir()
+
+    with patch("innout.batch.drive.upload_to_drive") as mock_upload:
+        mock_upload.side_effect = RuntimeError("network died")
+        with pytest.raises(RuntimeError, match="network died"):
+            push_one_file(src, "Parent/leaf", "pw", work, 1, None)
+
+    assert list(work.iterdir()) == [], f"chunks left behind: {list(work.iterdir())}"
+
+
+def test_push_one_file_splits_large_input_into_several_parts(tmp_path):
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"y" * (3 * 1024 * 1024))
+    work = tmp_path / "work"
+    work.mkdir()
+
+    with patch("innout.batch.drive.upload_to_drive") as mock_upload:
+        mock_upload.return_value = "url"
+        entry = push_one_file(src, "p/leaf", "pw", work, chunk_size_mb=1, credentials=None)
+
+    assert entry["parts"] == 4  # 3 MB payload plus the crypto header
+    assert len(mock_upload.call_args.args[0]) == entry["parts"]
+
+
+def test_push_one_file_payload_round_trips(tmp_path):
+    """The uploaded chunks must decrypt back to the original bytes."""
+    original = bytes(range(256)) * 2000
+    src = tmp_path / "001.zip"
+    src.write_bytes(original)
+    work = tmp_path / "work"
+    work.mkdir()
+    kept = tmp_path / "kept"
+    kept.mkdir()
+
+    def _capture(chunks, leaf, credentials):
+        for chunk in chunks:
+            shutil.copy(chunk, kept / chunk.name)
+        return "url"
+
+    with patch("innout.batch.drive.upload_to_drive", side_effect=_capture):
+        entry = push_one_file(src, "p/leaf", "pw", work, 1, None)
+
+    joined = tmp_path / "joined"
+    splitter.join_files(sorted(kept.glob("*.part???")), joined)
+    out = tmp_path / "out"
+    crypto.decrypt_stream(joined, out, "pw")
+    assert out.read_bytes() == original
+    assert sha256_file(out) == entry["sha256"]
+
+
+# ---------------------------------------------------------------------------
+# Passphrase handling
+# ---------------------------------------------------------------------------
+
+def test_get_passphrase_requires_env_var(monkeypatch):
+    monkeypatch.delenv("INNOUT_PASSPHRASE", raising=False)
+    with pytest.raises(SystemExit, match="INNOUT_PASSPHRASE is not set"):
+        batch._get_passphrase()
+
+
+def test_get_passphrase_reads_env_var(monkeypatch):
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "from-env")
+    assert batch._get_passphrase() == "from-env"
+
+
+@pytest.mark.parametrize("sub", ["plan", "push", "pull"])
+def test_parser_rejects_passphrase_flag(sub):
+    """Accepting a passphrase argument would leak it into ps and shell history."""
+    assert "--passphrase" not in build_parser().format_help()
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([sub, "--repo", "o/r", "--passphrase", "secret"])
+
+
+# ---------------------------------------------------------------------------
+# CLI defaults
+# ---------------------------------------------------------------------------
+
+def test_main_defaults_split_to_videos_and_parent_to_repo_name(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(batch, "cmd_plan", lambda args: captured.update(vars(args)))
+    monkeypatch.setattr(
+        "sys.argv", ["innout-batch", "plan", "--repo", "MME-Benchmarks/Video-MME-v2"]
+    )
+    batch.main()
+    assert captured["split"] == ["videos/*"]
+    assert captured["drive_parent"] == "Video-MME-v2"
+    assert captured["repo_type"] == "dataset"
+    assert captured["chunk_size"] == 1800
+
+
+def test_main_respects_explicit_parent_and_split(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(batch, "cmd_push", lambda args: captured.update(vars(args)))
+    monkeypatch.setattr("sys.argv", [
+        "innout-batch", "push", "--repo", "o/r",
+        "--drive-parent", "VideoMME-v2", "--split", "videos/*", "--split", "*.parquet",
+    ])
+    batch.main()
+    assert captured["drive_parent"] == "VideoMME-v2"
+    assert captured["split"] == ["videos/*", "*.parquet"]
+
+
+def test_parser_rejects_unknown_repo_type():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["plan", "--repo", "o/r", "--repo-type", "nonsense"])
+
+
+def test_parser_requires_repo():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["plan"])
+
+
+# ---------------------------------------------------------------------------
+# cmd_push resume behaviour
+# ---------------------------------------------------------------------------
+
+def _push_args(led: Path, parent: str = "P", extra: list[str] | None = None):
+    args = build_parser().parse_args(
+        ["push", "--repo", "o/r", "--drive-parent", parent, "--ledger", str(led)]
+        + (extra or [])
+    )
+    args.split = ["videos/*"]
+    return args
+
+
+def test_cmd_push_resumes_and_skips_done_entries(tmp_path, monkeypatch, capsys):
+    """Interrupted run: only the unfinished files get pushed again."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    save_ledger(led, {"repo_id": "o/r", "entries": {"videos/001.zip": _entry()}})
+
+    monkeypatch.setattr(
+        batch, "_list_repo_files",
+        lambda repo_id, repo_type: ["videos/001.zip", "videos/002.zip"],
+    )
+    monkeypatch.setattr(batch, "_download_one", _stub_download)
+
+    pushed = []
+
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size, credentials):
+        pushed.append(leaf)
+        return _entry(leaf=leaf, original_name=local_path.name)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    batch.cmd_push(_push_args(led))
+
+    assert pushed == ["P/videos-002"], "already-pushed file must be skipped"
+    assert set(load_ledger(led)["entries"]) == {"videos/001.zip", "videos/002.zip"}
+    assert "1 already pushed, 1 to go" in capsys.readouterr().out
+
+
+def test_cmd_push_is_a_noop_when_everything_is_done(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    save_ledger(led, {"entries": {"videos/001.zip": _entry()}})
+    monkeypatch.setattr(
+        batch, "_list_repo_files", lambda repo_id, repo_type: ["videos/001.zip"]
+    )
+    monkeypatch.setattr(
+        batch, "push_one_file", MagicMock(side_effect=AssertionError("must not push"))
+    )
+
+    batch.cmd_push(_push_args(led))
+    assert "Nothing to do" in capsys.readouterr().out
+
+
+def test_cmd_push_writes_ledger_after_each_file(tmp_path, monkeypatch):
+    """A crash on file 2 must leave file 1 recorded, not lose the whole run."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    monkeypatch.setattr(
+        batch, "_list_repo_files",
+        lambda repo_id, repo_type: ["videos/001.zip", "videos/002.zip"],
+    )
+    monkeypatch.setattr(batch, "_download_one", _stub_download)
+
+    calls = {"n": 0}
+
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size, credentials):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("upload died on the second file")
+        return _entry(leaf=leaf, original_name=local_path.name)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+
+    with pytest.raises(RuntimeError, match="second file"):
+        batch.cmd_push(_push_args(led))
+
+    assert set(load_ledger(led)["entries"]) == {"videos/001.zip"}
+
+
+def test_cmd_push_bundles_small_files_into_one_leaf(tmp_path, monkeypatch):
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    monkeypatch.setattr(
+        batch, "_list_repo_files",
+        lambda repo_id, repo_type: ["videos/001.zip", "eval.yaml", "test.parquet"],
+    )
+    monkeypatch.setattr(batch, "_download_one", _stub_download)
+
+    leaves = []
+
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size, credentials):
+        leaves.append(leaf)
+        return _entry(leaf=leaf, original_name=local_path.name)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    batch.cmd_push(_push_args(led, parent="VideoMME-v2"))
+
+    assert sorted(leaves) == ["VideoMME-v2/annotations", "VideoMME-v2/videos-001"]
+    entries = load_ledger(led)["entries"]
+    assert sorted(entries["<bundle:annotations>"]["bundled_files"]) == [
+        "eval.yaml", "test.parquet",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# cmd_pull verification
+# ---------------------------------------------------------------------------
+
+def _seed_drive(monkeypatch, payload: bytes, passphrase: str, store: Path):
+    """Encrypt+split payload into store, and make download_from_drive serve it."""
+    store.mkdir(parents=True, exist_ok=True)
+    src = store / "src"
+    src.write_bytes(payload)
+    enc = store / "enc"
+    crypto.encrypt_stream(src, enc, passphrase)
+    chunks = splitter.split_file(enc, "sess", store, 1024 * 1024)
+    src.unlink()
+    enc.unlink()
+
+    def _fake_download(leaf, dest_dir, credentials=None):
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        copied = [Path(shutil.copy(c, dest_dir / c.name)) for c in chunks]
+        return sorted(copied, key=lambda p: p.name)
+
+    monkeypatch.setattr(batch.drive, "download_from_drive", _fake_download)
+
+
+def _pull_args(led: Path, out: Path, extra: list[str] | None = None):
+    return build_parser().parse_args(
+        ["pull", "--repo", "o/r", "--ledger", str(led), "--output", str(out)]
+        + (extra or [])
+    )
+
+
+def test_cmd_pull_restores_original_filename_and_verifies(tmp_path, monkeypatch):
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    payload = bytes(range(256)) * 300
+    _seed_drive(monkeypatch, payload, "pw", tmp_path / "store")
+
+    led = tmp_path / "led.json"
+    save_ledger(led, {"entries": {"videos/001.zip": _entry(
+        leaf="VideoMME-v2/videos-001",
+        sha256=hashlib.sha256(payload).hexdigest(),
+        size=len(payload),
+    )}})
+
+    out = tmp_path / "out"
+    batch.cmd_pull(_pull_args(led, out))
+
+    # Named by its repo path, not the opaque "result" a raw pull would give.
+    restored = out / "videos" / "001.zip"
+    assert restored.exists()
+    assert restored.read_bytes() == payload
+
+
+def test_cmd_pull_fails_loudly_on_sha256_mismatch(tmp_path, monkeypatch, capsys):
+    """A corrupted transfer must never be reported as success."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    _seed_drive(monkeypatch, b"actual payload", "pw", tmp_path / "store")
+
+    led = tmp_path / "led.json"
+    save_ledger(led, {"entries": {"videos/001.zip": _entry(sha256="f" * 64)}})
+
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit, match="failed verification"):
+        batch.cmd_pull(_pull_args(led, out))
+
+    assert "SHA256 MISMATCH" in capsys.readouterr().out
+    assert not (out / "videos" / "001.zip").exists()
+
+
+def test_cmd_pull_skips_existing_unless_forced(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    monkeypatch.setattr(
+        batch.drive, "download_from_drive",
+        MagicMock(side_effect=AssertionError("must not download")),
+    )
+    led = tmp_path / "led.json"
+    save_ledger(led, {"entries": {"videos/001.zip": _entry()}})
+    out = tmp_path / "out"
+    (out / "videos").mkdir(parents=True)
+    (out / "videos" / "001.zip").write_bytes(b"already here")
+
+    batch.cmd_pull(_pull_args(led, out))
+    assert "skip (already present" in capsys.readouterr().out
+
+
+def test_cmd_pull_force_redownloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    payload = b"fresh payload " * 50
+    _seed_drive(monkeypatch, payload, "pw", tmp_path / "store")
+    led = tmp_path / "led.json"
+    save_ledger(led, {"entries": {"videos/001.zip": _entry(
+        sha256=hashlib.sha256(payload).hexdigest()
+    )}})
+    out = tmp_path / "out"
+    (out / "videos").mkdir(parents=True)
+    (out / "videos" / "001.zip").write_bytes(b"stale")
+
+    batch.cmd_pull(_pull_args(led, out, ["--force"]))
+    assert (out / "videos" / "001.zip").read_bytes() == payload
+
+
+def test_cmd_pull_errors_on_empty_ledger(tmp_path):
+    args = _pull_args(tmp_path / "missing.json", tmp_path / "out")
+    with pytest.raises(SystemExit, match="no pushed entries"):
+        batch.cmd_pull(args)
+
+
+def test_cmd_pull_only_filters_targets(tmp_path, monkeypatch):
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    save_ledger(led, {"entries": {
+        "videos/001.zip": _entry(leaf="P/videos-001"),
+        "videos/002.zip": _entry(leaf="P/videos-002"),
+    }})
+    args = _pull_args(led, tmp_path / "out", ["--only", "videos/009.zip"])
+    with pytest.raises(SystemExit, match="none of"):
+        batch.cmd_pull(args)
