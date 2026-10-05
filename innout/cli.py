@@ -43,7 +43,11 @@ def cmd_push(args: argparse.Namespace) -> None:
     tmpdir = tempfile.mkdtemp()
     try:
         src_path = sources.acquire(
-            source_type, source, Path(tmpdir), excludes=args.exclude
+            source_type,
+            source,
+            Path(tmpdir),
+            excludes=args.exclude,
+            repo_type=args.repo_type,
         )
         session_id = str(uuid.uuid4())
         crypto.encrypt_stream(src_path, Path(tmpdir) / "encrypted", passphrase)
@@ -140,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_group.add_argument("--url", metavar="<url>", help="Remote URL to fetch and push")
     source_group.add_argument("--local", metavar="<path>", help="Local path to push")
     source_group.add_argument("--github", metavar="owner/repo", help="GitHub repo to push")
-    source_group.add_argument("--hf", metavar="org/model", help="HuggingFace model/dataset to push")
+    source_group.add_argument("--hf", metavar="org/repo", help="HuggingFace repo to push")
     dest_group = push_parser.add_mutually_exclusive_group()
     dest_group.add_argument("--server", metavar="<url>", help="innout server URL")
     dest_group.add_argument("--drive", metavar="<folder>", help="Google Drive folder name")
@@ -161,6 +165,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1800,
         help="Chunk size in MB (default: 1800)",
+    )
+    push_parser.add_argument(
+        "--repo-type",
+        metavar="<kind>",
+        choices=["model", "dataset", "space"],
+        default="model",
+        help="Kind of HuggingFace repo given to --hf: model, dataset, or space "
+             "(default: model). Required for dataset repos, e.g. "
+             "--hf MME-Benchmarks/Video-MME-v2 --repo-type dataset",
     )
     push_parser.add_argument(
         "--exclude",

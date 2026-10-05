@@ -90,7 +90,8 @@ innout push [source] \
   [--passphrase <str>] \
   [--credentials <path>] \
   [--api-key <key>] \
-  [--chunk-size <MB>]
+  [--chunk-size <MB>] \
+  [--repo-type model|dataset|space]
 ```
 
 Source options (pick one):
@@ -100,12 +101,22 @@ Source options (pick one):
 | `--url <url>` | Download from a remote URL |
 | `--local <path>` | Local file or directory (directories are tar.gz'd) |
 | `--github owner/repo[@branch]` | Clone a GitHub repo |
-| `--hf org/model` | Hugging Face snapshot |
+| `--hf org/repo` | Hugging Face snapshot (see `--repo-type`) |
 
 If `--passphrase` is omitted, checks `INNOUT_PASSPHRASE` env var, then prompts interactively.
 If `--api-key` is omitted, checks `INNOUT_API_KEY` env var.
 
 `--chunk-size` defaults to 1800 MB. Tune it to stay under your server's upload limits.
+
+`--repo-type` tells `--hf` which kind of Hub repo the ID points at — `model` (default), `dataset`, or `space`. Models and datasets live in separate namespaces, so a dataset ID fetched as a model 404s:
+
+```bash
+# huggingface.co/datasets/MME-Benchmarks/Video-MME-v2
+innout push --hf MME-Benchmarks/Video-MME-v2 --repo-type dataset \
+  --drive "video-mme-v2" --passphrase "correct horse battery"
+```
+
+Gated datasets need `hf auth login` (or `HF_TOKEN`) first — accept the terms on the dataset page, otherwise the snapshot download fails with 401/403.
 
 ### Push to Google Drive
 

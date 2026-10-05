@@ -59,6 +59,7 @@ def acquire(
     source: str,
     work_dir: Path,
     excludes: list[str] | None = None,
+    repo_type: str = "model",
 ) -> Path:
     """Download / copy / clone the source into work_dir and return the path
     to a single file (tar.gz for directories/repos, original file for URLs/local files).
@@ -68,8 +69,10 @@ def acquire(
       - 'url'    → https://... URL to download
       - 'local'  → path string; if it's a directory, tar.gz it first
       - 'github' → "owner/repo" or "owner/repo@branch"
-      - 'hf'     → "org/model-name" HuggingFace repo ID
+      - 'hf'     → "org/repo-name" HuggingFace repo ID
     work_dir: scratch directory to place intermediate files
+    repo_type: HuggingFace repo kind ('model' | 'dataset' | 'space'); only
+      used when source_type is 'hf'
 
     Returns: Path to a single file inside work_dir
     """
@@ -83,7 +86,7 @@ def acquire(
     elif source_type == "github":
         return _acquire_github(source, work_dir, excludes)
     elif source_type == "hf":
-        return _acquire_hf(source, work_dir, excludes)
+        return _acquire_hf(source, work_dir, excludes, repo_type)
     else:
         raise ValueError(
             f"Unknown source_type {source_type!r}. "
@@ -153,14 +156,21 @@ def _acquire_github(
 
 
 def _acquire_hf(
-    source: str, work_dir: Path, excludes: list[str] | None = None
+    source: str,
+    work_dir: Path,
+    excludes: list[str] | None = None,
+    repo_type: str = "model",
 ) -> Path:
-    """Download a HuggingFace repo snapshot and return a tar.gz archive."""
+    """Download a HuggingFace repo snapshot and return a tar.gz archive.
+
+    repo_type must match the repo's kind on the Hub — models and datasets
+    live in separate namespaces, so a dataset ID resolved as a model 404s.
+    """
     from huggingface_hub import snapshot_download  # type: ignore[import]
 
     repo_name = source.split("/")[-1]
     local_dir = work_dir / repo_name
 
-    snapshot_download(repo_id=source, local_dir=str(local_dir))
+    snapshot_download(repo_id=source, repo_type=repo_type, local_dir=str(local_dir))
 
     return _tar_gz_dir(local_dir, work_dir, excludes)
