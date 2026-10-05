@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import ssl
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -40,11 +41,42 @@ VIDEO_MME_FILES = [
 ]
 
 
-def _entry(**overrides) -> dict:
-    """A ledger entry with synthetic values; override what a test cares about."""
-    entry = {
-        "leaf": "P/videos-001",
+def _piece(**overrides) -> dict:
+    """One piece of a ledger entry, with synthetic values."""
+    piece = {
+        "name": "aa",
+        "leaf": "P/videos/001/aa",
         "session_id": "00000000-0000-0000-0000-000000000000",
+        "sha256": "0" * 64,
+        "size": 1,
+        "parts": 1,
+        "folder_url": "https://drive.google.com/drive/folders/synthetic-id",
+        "original_name": "aa",
+        "pushed_at": "2026-10-05T07:31:04Z",
+    }
+    piece.update(overrides)
+    return piece
+
+
+def _entry(**overrides) -> dict:
+    """A ledger entry in the current (piece-bearing) shape."""
+    entry = {
+        "sha256": "0" * 64,
+        "size": 1,
+        "piece_size_bytes": 1024 * 1024 * 1024,
+        "pieces": [_piece()],
+        "original_name": "001.zip",
+        "pushed_at": "2026-10-05T07:31:04Z",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _legacy_entry(**overrides) -> dict:
+    """The pre-splitting shape: one session, no pieces list."""
+    entry = {
+        "leaf": "P/videos/001",
+        "session_id": "11111111-0000-0000-0000-000000000000",
         "sha256": "0" * 64,
         "size": 1,
         "parts": 1,
@@ -469,12 +501,13 @@ def test_cmd_push_resumes_and_skips_done_entries(tmp_path, monkeypatch, capsys):
 
     pushed = []
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
-                   credentials, session_id=None):
-        pushed.append(leaf)
-        return _entry(leaf=leaf, original_name=local_path.name)
+    def _fake_push(local_path, base_leaf, passphrase, work_dir, chunk_size,
+                   credentials, max_piece_bytes, already=None, on_piece=None):
+        pushed.append(base_leaf)
+        return _entry(original_name=local_path.name,
+                      pieces=[_piece(leaf=f"{base_leaf}/aa")])
 
-    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    monkeypatch.setattr(batch, "push_pieces", _fake_push)
     batch.cmd_push(_push_args(led))
 
     assert pushed == ["P/videos/002"], "already-pushed file must be skipped"
@@ -490,7 +523,7 @@ def test_cmd_push_is_a_noop_when_everything_is_done(tmp_path, monkeypatch, capsy
         batch, "_list_repo_files", lambda repo_id, repo_type: ["videos/001.zip"]
     )
     monkeypatch.setattr(
-        batch, "push_one_file", MagicMock(side_effect=AssertionError("must not push"))
+        batch, "push_pieces", MagicMock(side_effect=AssertionError("must not push"))
     )
 
     batch.cmd_push(_push_args(led))
@@ -513,12 +546,13 @@ def test_cmd_push_writes_ledger_after_each_file(tmp_path, monkeypatch):
 
     seen_mid_run = []
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
-                   credentials, session_id=None):
+    def _fake_push(local_path, base_leaf, passphrase, work_dir, chunk_size,
+                   credentials, max_piece_bytes, already=None, on_piece=None):
         seen_mid_run.append(set(load_ledger(led).get("entries", {})))
-        return _entry(leaf=leaf, original_name=local_path.name)
+        return _entry(original_name=local_path.name,
+                      pieces=[_piece(leaf=f"{base_leaf}/aa")])
 
-    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    monkeypatch.setattr(batch, "push_pieces", _fake_push)
     batch.cmd_push(_push_args(led))
 
     assert seen_mid_run[0] == set(), "nothing recorded before the first push"
@@ -537,12 +571,13 @@ def test_cmd_push_bundles_small_files_into_one_leaf(tmp_path, monkeypatch):
 
     leaves = []
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
-                   credentials, session_id=None):
-        leaves.append(leaf)
-        return _entry(leaf=leaf, original_name=local_path.name)
+    def _fake_push(local_path, base_leaf, passphrase, work_dir, chunk_size,
+                   credentials, max_piece_bytes, already=None, on_piece=None):
+        leaves.append(base_leaf)
+        return _entry(original_name=local_path.name,
+                      pieces=[_piece(leaf=f"{base_leaf}/aa")])
 
-    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    monkeypatch.setattr(batch, "push_pieces", _fake_push)
     batch.cmd_push(_push_args(led, parent="Video-MME-v2"))
 
     assert sorted(leaves) == [
@@ -578,14 +613,15 @@ def test_cmd_push_bundle_excludes_hf_download_cache(tmp_path, monkeypatch):
 
     archived: list[list[str]] = []
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
-                   credentials, session_id=None):
+    def _fake_push(local_path, base_leaf, passphrase, work_dir, chunk_size,
+                   credentials, max_piece_bytes, already=None, on_piece=None):
         import tarfile
         with tarfile.open(local_path, "r:gz") as tf:
             archived.append(tf.getnames())
-        return _entry(leaf=leaf, original_name=local_path.name)
+        return _entry(original_name=local_path.name,
+                      pieces=[_piece(leaf=f"{base_leaf}/aa")])
 
-    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    monkeypatch.setattr(batch, "push_pieces", _fake_push)
     batch.cmd_push(_push_args(led))
 
     names = archived[0]
@@ -607,12 +643,12 @@ def test_cmd_push_gives_each_video_its_own_leaf(tmp_path, monkeypatch):
 
     seen = []
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
-                   credentials, session_id=None):
-        seen.append((leaf, session_id))
-        return _entry(leaf=leaf, session_id=session_id)
+    def _fake_push(local_path, base_leaf, passphrase, work_dir, chunk_size,
+                   credentials, max_piece_bytes, already=None, on_piece=None):
+        seen.append((base_leaf, uuid.uuid4().hex))
+        return _entry(pieces=[_piece(leaf=f"{base_leaf}/aa")])
 
-    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    monkeypatch.setattr(batch, "push_pieces", _fake_push)
     batch.cmd_push(_push_args(led, parent="Video-MME-v2"))
 
     assert {leaf for leaf, _ in seen} == {
@@ -639,13 +675,13 @@ def test_cmd_push_skips_a_failed_file_and_keeps_going(tmp_path, monkeypatch, cap
     monkeypatch.setattr(batch, "_download_one", _stub_download)
     monkeypatch.setattr(batch.drive, "delete_session_files", lambda *a, **k: 0)
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
-                   credentials, session_id=None):
+    def _fake_push(local_path, base_leaf, passphrase, work_dir, chunk_size,
+                   credentials, max_piece_bytes, already=None, on_piece=None):
         if local_path.name == "002.zip":
             raise OSError("connection reset by peer")
-        return _entry(leaf=leaf, session_id=session_id)
+        return _entry(pieces=[_piece(leaf=f"{base_leaf}/aa")])
 
-    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    monkeypatch.setattr(batch, "push_pieces", _fake_push)
 
     with pytest.raises(SystemExit) as excinfo:
         batch.cmd_push(_push_args(led))
@@ -662,45 +698,57 @@ def test_cmd_push_skips_a_failed_file_and_keeps_going(tmp_path, monkeypatch, cap
     assert "1 target(s) failed" in out
 
 
-def test_cmd_push_cleans_up_orphan_chunks_after_a_failure(tmp_path, monkeypatch):
-    """Resuming mints a new session id, so a failure's chunks must be deleted."""
-    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
-    led = tmp_path / "led.json"
-    monkeypatch.setattr(
-        batch, "_list_repo_files", lambda repo_id, repo_type: ["videos/001.zip"]
-    )
-    monkeypatch.setattr(batch, "_download_one", _stub_download)
+def test_push_pieces_cleans_up_a_failed_piece(tmp_path, monkeypatch):
+    """A piece that dies mid-upload must not leave orphan chunks on Drive.
+
+    The retry mints a new session id, so those chunks would never be reused.
+    Finished pieces are kept on purpose, so the retry can skip them.
+    """
+    src = tmp_path / "003.zip"
+    src.write_bytes(b"x" * 2500)
+    work = tmp_path / "work"
+    work.mkdir()
 
     cleaned = []
-
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
-                   credentials, session_id=None):
-        raise ssl.SSLError("[SYS] unknown error")
-
-    monkeypatch.setattr(batch, "push_one_file", _fake_push)
     monkeypatch.setattr(
         batch.drive, "delete_session_files",
-        lambda leaf, session_id, creds=None: cleaned.append((leaf, session_id)) or 2,
+        lambda leaf, session_id, creds=None: (
+            cleaned.append((leaf, session_id)) or 3
+        ),
     )
 
-    with pytest.raises(SystemExit):
-        batch.cmd_push(_push_args(led))
+    calls = {"n": 0}
 
-    assert len(cleaned) == 1
+    def _fake_one(local_path, leaf, passphrase, work_dir, chunk_size,
+                  credentials, session_id=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ssl.SSLError("[SYS] unknown error")
+        return _piece(name=local_path.name, leaf=leaf, session_id=session_id)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_one)
+
+    kept = []
+    with pytest.raises(ssl.SSLError):
+        batch.push_pieces(
+            src, "P/videos/003", "pw", work, 1, None,
+            max_piece_bytes=1000, on_piece=kept.append,
+        )
+
+    assert len(cleaned) == 1, "exactly the failed piece is cleaned"
     leaf, session_id = cleaned[0]
-    assert leaf == "P/videos/001"
-    # The id handed to cleanup is the one the push used, not a fresh one.
-    assert session_id == load_ledger(led)["failures"]["videos/001.zip"]["session_id"]
+    assert leaf == "P/videos/003/ab", leaf
+    assert session_id, "cleanup needs the session id the push actually used"
+    assert [k["name"] for k in kept] == ["aa"], "piece aa must be kept for resume"
 
 
-def test_cmd_push_survives_a_cleanup_failure(tmp_path, monkeypatch, capsys):
-    """Failing to delete orphans is worth a warning, not a crash."""
-    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
-    led = tmp_path / "led.json"
-    monkeypatch.setattr(
-        batch, "_list_repo_files", lambda repo_id, repo_type: ["videos/001.zip"]
-    )
-    monkeypatch.setattr(batch, "_download_one", _stub_download)
+def test_push_pieces_survives_a_cleanup_failure(tmp_path, monkeypatch, capsys):
+    """Failing to delete orphans warns; the original error still propagates."""
+    src = tmp_path / "003.zip"
+    src.write_bytes(b"x" * 1500)
+    work = tmp_path / "work"
+    work.mkdir()
+
     monkeypatch.setattr(
         batch, "push_one_file",
         MagicMock(side_effect=OSError("upload died")),
@@ -710,9 +758,10 @@ def test_cmd_push_survives_a_cleanup_failure(tmp_path, monkeypatch, capsys):
         MagicMock(side_effect=RuntimeError("cleanup also died")),
     )
 
-    with pytest.raises(SystemExit):
-        batch.cmd_push(_push_args(led))
-    assert "WARNING: could not clean up" in capsys.readouterr().out
+    with pytest.raises(OSError, match="upload died"):
+        batch.push_pieces(src, "P/videos/003", "pw", work, 1, None,
+                          max_piece_bytes=1000)
+    assert "WARNING could not clean up" in capsys.readouterr().out
 
 
 def test_cmd_push_retries_only_the_failed_file_on_rerun(tmp_path, monkeypatch):
@@ -734,12 +783,12 @@ def test_cmd_push_retries_only_the_failed_file_on_rerun(tmp_path, monkeypatch):
 
     pushed = []
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
-                   credentials, session_id=None):
+    def _fake_push(local_path, base_leaf, passphrase, work_dir, chunk_size,
+                   credentials, max_piece_bytes, already=None, on_piece=None):
         pushed.append(local_path.name)
-        return _entry(leaf=leaf, session_id=session_id)
+        return _entry(pieces=[_piece(leaf=f"{base_leaf}/aa")])
 
-    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    monkeypatch.setattr(batch, "push_pieces", _fake_push)
     batch.cmd_push(_push_args(led))
 
     assert pushed == ["002.zip"]
@@ -759,7 +808,7 @@ def test_cmd_push_does_not_swallow_keyboard_interrupt(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(batch, "_download_one", _stub_download)
     monkeypatch.setattr(
-        batch, "push_one_file", MagicMock(side_effect=KeyboardInterrupt)
+        batch, "push_pieces", MagicMock(side_effect=KeyboardInterrupt)
     )
 
     with pytest.raises(KeyboardInterrupt):
@@ -803,10 +852,11 @@ def test_cmd_pull_restores_original_filename_and_verifies(tmp_path, monkeypatch)
     _seed_drive(monkeypatch, payload, "pw", tmp_path / "store")
 
     led = tmp_path / "led.json"
+    digest = hashlib.sha256(payload).hexdigest()
     save_ledger(led, {"entries": {"videos/001.zip": _entry(
-        leaf="VideoMME-v2/videos-001",
-        sha256=hashlib.sha256(payload).hexdigest(),
-        size=len(payload),
+        sha256=digest, size=len(payload),
+        pieces=[_piece(leaf="Video-MME-v2/videos/001/aa", sha256=digest,
+                       size=len(payload))],
     )}})
 
     out = tmp_path / "out"
@@ -824,7 +874,10 @@ def test_cmd_pull_fails_loudly_on_sha256_mismatch(tmp_path, monkeypatch, capsys)
     _seed_drive(monkeypatch, b"actual payload", "pw", tmp_path / "store")
 
     led = tmp_path / "led.json"
-    save_ledger(led, {"entries": {"videos/001.zip": _entry(sha256="f" * 64)}})
+    save_ledger(led, {"entries": {"videos/001.zip": _entry(
+        sha256="f" * 64,
+        pieces=[_piece(sha256=hashlib.sha256(b"actual payload").hexdigest())],
+    )}})
 
     out = tmp_path / "out"
     with pytest.raises(SystemExit, match="failed verification"):
@@ -855,8 +908,9 @@ def test_cmd_pull_force_redownloads(tmp_path, monkeypatch):
     payload = b"fresh payload " * 50
     _seed_drive(monkeypatch, payload, "pw", tmp_path / "store")
     led = tmp_path / "led.json"
+    digest = hashlib.sha256(payload).hexdigest()
     save_ledger(led, {"entries": {"videos/001.zip": _entry(
-        sha256=hashlib.sha256(payload).hexdigest()
+        sha256=digest, pieces=[_piece(sha256=digest)],
     )}})
     out = tmp_path / "out"
     (out / "videos").mkdir(parents=True)
@@ -876,9 +930,276 @@ def test_cmd_pull_only_filters_targets(tmp_path, monkeypatch):
     monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
     led = tmp_path / "led.json"
     save_ledger(led, {"entries": {
-        "videos/001.zip": _entry(leaf="P/videos-001"),
-        "videos/002.zip": _entry(leaf="P/videos-002"),
+        "videos/001.zip": _entry(pieces=[_piece(leaf="P/videos/001/aa")]),
+        "videos/002.zip": _entry(pieces=[_piece(leaf="P/videos/002/aa")]),
     }})
     args = _pull_args(led, tmp_path / "out", ["--only", "videos/009.zip"])
     with pytest.raises(SystemExit, match="none of"):
         batch.cmd_pull(args)
+
+
+# ---------------------------------------------------------------------------
+# Piece splitting — the AES-GCM ceiling
+# ---------------------------------------------------------------------------
+
+def test_piece_names_sort_into_piece_order():
+    """Two letters so `cat dec/*/result` reassembles without sorting logic."""
+    names = batch.piece_names(30)
+    assert names[:3] == ["aa", "ab", "ac"]
+    assert names[26] == "ba"
+    assert names == sorted(names)
+
+
+def test_piece_names_rejects_degenerate_counts():
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="count must be"):
+            batch.piece_names(bad)
+    with pytest.raises(ValueError, match="too many pieces"):
+        batch.piece_names(26 * 26 + 1)
+
+
+def test_piece_count_rounds_up_and_never_returns_zero():
+    assert batch.piece_count(0, 1000) == 1, "an empty file is still one piece"
+    assert batch.piece_count(1, 1000) == 1
+    assert batch.piece_count(1000, 1000) == 1
+    assert batch.piece_count(1001, 1000) == 2
+    assert batch.piece_count(3000, 1000) == 3
+
+
+def test_split_into_pieces_round_trips(tmp_path):
+    src = tmp_path / "003.zip"
+    payload = bytes(range(256)) * 400  # 102 400 bytes
+    src.write_bytes(payload)
+
+    pieces = batch.split_into_pieces(src, tmp_path / "pieces", 30_000)
+
+    assert [p.name for p in pieces] == ["aa", "ab", "ac", "ad"]
+    assert all(p.stat().st_size <= 30_000 for p in pieces)
+    assert b"".join(p.read_bytes() for p in pieces) == payload
+
+
+def test_split_into_pieces_handles_an_exact_multiple(tmp_path):
+    src = tmp_path / "f.bin"
+    src.write_bytes(b"x" * 2000)
+    pieces = batch.split_into_pieces(src, tmp_path / "p", 1000)
+    assert [p.stat().st_size for p in pieces] == [1000, 1000]
+
+
+def test_split_into_pieces_handles_an_empty_file(tmp_path):
+    src = tmp_path / "empty.bin"
+    src.write_bytes(b"")
+    pieces = batch.split_into_pieces(src, tmp_path / "p", 1000)
+    assert [p.stat().st_size for p in pieces] == [0]
+
+
+def test_split_into_pieces_refuses_a_piece_size_over_the_ceiling(tmp_path):
+    """Regression: videos/003.zip (3.43 GB) died inside AESGCM.encrypt with
+    `OverflowError: Data or associated data too long. Max 2**31 - 1 bytes`.
+    A piece size above the ceiling must fail here, with that explanation,
+    rather than deep in the crypto library."""
+    src = tmp_path / "f.bin"
+    src.write_bytes(b"x")
+    with pytest.raises(ValueError, match="exceeds the AES-GCM ceiling"):
+        batch.split_into_pieces(src, tmp_path / "p", batch.AESGCM_MAX_BYTES + 1)
+
+
+def test_default_piece_size_leaves_real_headroom():
+    """The user's requirement: well under 2 GB, with margin — not just under."""
+    default_bytes = batch.DEFAULT_PIECE_MB * 1024 * 1024
+    headroom = batch.AESGCM_MAX_BYTES - default_bytes
+    assert headroom > 0, "default piece size must fit under the ceiling"
+    assert headroom >= 512 * 1024 * 1024, (
+        f"only {headroom / 1e6:.0f} MB of headroom; the user asked for "
+        f"comfortably under 2 GB, not just under"
+    )
+
+
+def test_every_video_mme_archive_splits_under_the_ceiling():
+    """No piece of the real dataset may reach the limit at the default size."""
+    real_sizes = [  # bytes, the 5 largest archives plus the smallest
+        5_095_000_000, 4_833_000_000, 4_438_000_000, 4_333_000_000,
+        4_294_000_000, 1_224_000_000,
+    ]
+    piece_bytes = batch.DEFAULT_PIECE_MB * 1024 * 1024
+    for size in real_sizes:
+        count = batch.piece_count(size, piece_bytes)
+        largest = min(size, piece_bytes)
+        assert largest < batch.AESGCM_MAX_BYTES, size
+        assert count * piece_bytes >= size, size
+
+
+# ---------------------------------------------------------------------------
+# push_pieces
+# ---------------------------------------------------------------------------
+
+def test_push_pieces_puts_each_piece_in_its_own_subfolder(tmp_path, monkeypatch):
+    src = tmp_path / "003.zip"
+    payload = b"z" * 2500
+    src.write_bytes(payload)
+    work = tmp_path / "work"
+    work.mkdir()
+
+    seen = []
+
+    def _fake_one(local_path, leaf, passphrase, work_dir, chunk_size,
+                  credentials, session_id=None):
+        seen.append((local_path.name, leaf, local_path.stat().st_size))
+        return _piece(name=local_path.name, leaf=leaf, session_id=session_id)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_one)
+    entry = batch.push_pieces(src, "P/videos/003", "pw", work, 1, None,
+                              max_piece_bytes=1000)
+
+    assert [(n, leaf) for n, leaf, _ in seen] == [
+        ("aa", "P/videos/003/aa"),
+        ("ab", "P/videos/003/ab"),
+        ("ac", "P/videos/003/ac"),
+    ]
+    assert [size for _, _, size in seen] == [1000, 1000, 500]
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["size"] == len(payload)
+    assert [p["name"] for p in entry["pieces"]] == ["aa", "ab", "ac"]
+
+
+def test_push_pieces_frees_the_source_and_pieces(tmp_path, monkeypatch):
+    """A 5 GB archive plus its pieces plus chunks would not fit otherwise."""
+    src = tmp_path / "003.zip"
+    src.write_bytes(b"z" * 2500)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setattr(
+        batch, "push_one_file",
+        lambda lp, leaf, *a, **k: _piece(name=lp.name, leaf=leaf),
+    )
+    batch.push_pieces(src, "P/v/003", "pw", work, 1, None, max_piece_bytes=1000)
+
+    assert not src.exists(), "the downloaded archive must go once split"
+    leftovers = [p for p in (work / "pieces").rglob("*") if p.is_file()]
+    assert leftovers == [], f"pieces left on disk: {leftovers}"
+
+
+def test_push_pieces_skips_pieces_already_uploaded(tmp_path, monkeypatch):
+    """Resuming an interrupted archive re-uploads only what is missing."""
+    src = tmp_path / "003.zip"
+    src.write_bytes(b"z" * 2500)
+    work = tmp_path / "work"
+    work.mkdir()
+
+    pushed = []
+
+    def _fake_one(local_path, leaf, passphrase, work_dir, chunk_size,
+                  credentials, session_id=None):
+        pushed.append(local_path.name)
+        return _piece(name=local_path.name, leaf=leaf, session_id=session_id)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_one)
+    already = {"aa": _piece(name="aa", leaf="P/videos/003/aa")}
+    entry = batch.push_pieces(src, "P/videos/003", "pw", work, 1, None,
+                              max_piece_bytes=1000, already=already)
+
+    assert pushed == ["ab", "ac"], "piece aa must not be re-uploaded"
+    assert [p["name"] for p in entry["pieces"]] == ["aa", "ab", "ac"]
+
+
+def test_push_pieces_reports_progress_per_piece(tmp_path, monkeypatch):
+    """on_piece lets the caller persist each piece before the next upload."""
+    src = tmp_path / "f.bin"
+    src.write_bytes(b"z" * 2500)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setattr(
+        batch, "push_one_file",
+        lambda lp, leaf, *a, **k: _piece(name=lp.name, leaf=leaf),
+    )
+    seen = []
+    batch.push_pieces(src, "P/v/003", "pw", work, 1, None,
+                      max_piece_bytes=1000, on_piece=seen.append)
+    assert [p["name"] for p in seen] == ["aa", "ab", "ac"]
+
+
+# ---------------------------------------------------------------------------
+# entry_pieces — ledger shape compatibility
+# ---------------------------------------------------------------------------
+
+def test_entry_pieces_reads_a_legacy_entry_as_one_piece():
+    """Entries pushed before splitting existed must stay pullable."""
+    pieces = batch.entry_pieces(_legacy_entry())
+    assert len(pieces) == 1
+    assert pieces[0]["leaf"] == "P/videos/001"
+    assert pieces[0]["session_id"] == "11111111-0000-0000-0000-000000000000"
+    assert pieces[0]["sha256"] == "0" * 64
+
+
+def test_entry_pieces_sorts_by_name():
+    entry = _entry(pieces=[_piece(name="ab"), _piece(name="aa")])
+    assert [p["name"] for p in batch.entry_pieces(entry)] == ["aa", "ab"]
+
+
+# ---------------------------------------------------------------------------
+# cmd_pull across pieces
+# ---------------------------------------------------------------------------
+
+def test_cmd_pull_reassembles_pieces_in_order(tmp_path, monkeypatch):
+    """Three pieces must concatenate back to the original bytes."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    parts = {"aa": b"A" * 900, "ab": b"B" * 900, "ac": b"C" * 300}
+    whole = b"".join(parts[n] for n in ("aa", "ab", "ac"))
+
+    stores = {}
+    for name, data in parts.items():
+        store = tmp_path / f"store-{name}"
+        store.mkdir()
+        src = store / "src"
+        src.write_bytes(data)
+        enc = store / "enc"
+        crypto.encrypt_stream(src, enc, "pw")
+        splitter.split_file(enc, f"sess-{name}", store, 1024 * 1024)
+        src.unlink()
+        enc.unlink()
+        stores[f"P/videos/003/{name}"] = store
+
+    def _fake_download(leaf, dest_dir, credentials=None, session_id=None):
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        return sorted(
+            Path(shutil.copy(c, dest_dir / c.name))
+            for c in sorted(stores[leaf].glob("*.part???"))
+        )
+
+    monkeypatch.setattr(batch.drive, "download_from_drive", _fake_download)
+
+    led = tmp_path / "led.json"
+    save_ledger(led, {"entries": {"videos/003.zip": _entry(
+        sha256=hashlib.sha256(whole).hexdigest(), size=len(whole),
+        pieces=[
+            _piece(name=n, leaf=f"P/videos/003/{n}",
+                   sha256=hashlib.sha256(parts[n]).hexdigest(),
+                   size=len(parts[n]))
+            for n in ("aa", "ab", "ac")
+        ],
+    )}})
+
+    out = tmp_path / "out"
+    batch.cmd_pull(_pull_args(led, out))
+    assert (out / "videos" / "003.zip").read_bytes() == whole
+
+
+def test_cmd_pull_fails_on_a_bad_piece_not_just_the_whole(tmp_path, monkeypatch, capsys):
+    """A corrupted piece must be named, rather than only the final hash failing."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    _seed_drive(monkeypatch, b"piece payload", "pw", tmp_path / "store")
+    led = tmp_path / "led.json"
+    save_ledger(led, {"entries": {"videos/003.zip": _entry(
+        sha256="0" * 64,
+        pieces=[_piece(name="aa", sha256="e" * 64)],
+    )}})
+
+    with pytest.raises(SystemExit, match="failed verification"):
+        batch.cmd_pull(_pull_args(led, tmp_path / "out"))
+    assert "piece aa sha256 mismatch" in capsys.readouterr().out
+
+
+def test_parser_default_piece_size_is_under_the_ceiling():
+    args = build_parser().parse_args(["push", "--repo", "o/r"])
+    assert args.max_piece_size == batch.DEFAULT_PIECE_MB
+    assert args.max_piece_size * 1024 * 1024 < batch.AESGCM_MAX_BYTES

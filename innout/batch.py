@@ -44,6 +44,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from innout import crypto, drive, splitter, unpack
 
@@ -52,6 +53,15 @@ _HASH_CHUNK = 4 * 1024 * 1024
 #: Leaf folder that collects every file --split does not match.
 BUNDLE_NAME = "annotations"
 _BUNDLE_PREFIX = "<bundle:"
+#: AES-GCM's single-shot ceiling. innout's crypto reads a whole file into
+#: memory and calls AESGCM.encrypt once, so anything above this raises
+#: OverflowError — 26 of Video-MME-v2's 40 archives are over it.
+AESGCM_MAX_BYTES = 2**31 - 1
+#: Default piece size: 1 GiB, leaving ~1 GB of headroom under the ceiling
+#: rather than a thin margin. It also caps memory, since encrypt/decrypt
+#: hold the plaintext plus a copy of the ciphertext — roughly 3x a piece,
+#: so ~3 GB here instead of ~6 GB for a 2 GB piece.
+DEFAULT_PIECE_MB = 1024
 PER_FILE = "per-file"
 SHARED = "shared"
 LAYOUTS = (PER_FILE, SHARED)
@@ -125,6 +135,61 @@ def assign_leaves(
     return leaves
 
 
+def piece_names(count: int) -> list[str]:
+    """Two-letter suffixes like Unix split: aa, ab, ... zz.
+
+    Two letters so lexical order is piece order for any plausible count,
+    which lets `cat pieces/*/result` reassemble without sorting logic.
+    """
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
+    if count > 26 * 26:
+        raise ValueError(f"too many pieces ({count}); raise the piece size")
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    return [letters[i // 26] + letters[i % 26] for i in range(count)]
+
+
+def piece_count(size: int, max_bytes: int) -> int:
+    """Pieces needed for `size` bytes; an empty file still needs one."""
+    if max_bytes < 1:
+        raise ValueError(f"max_bytes must be >= 1, got {max_bytes}")
+    return max(1, -(-size // max_bytes))
+
+
+def split_into_pieces(src: Path, out_dir: Path, max_bytes: int) -> list[Path]:
+    """Cut src into pieces of at most max_bytes, named aa, ab, ...
+
+    Returns the piece paths in order. Each piece has to clear
+    AESGCM_MAX_BYTES on its own, so max_bytes is checked here rather than
+    trusting the caller — a piece over the ceiling fails deep inside the
+    crypto library with an opaque OverflowError.
+    """
+    if max_bytes > AESGCM_MAX_BYTES:
+        raise ValueError(
+            f"piece size {max_bytes} exceeds the AES-GCM ceiling "
+            f"{AESGCM_MAX_BYTES}; encryption would fail"
+        )
+    src = Path(src)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    names = piece_names(piece_count(src.stat().st_size, max_bytes))
+
+    pieces: list[Path] = []
+    with open(src, "rb") as fh:
+        for name in names:
+            piece = out_dir / name
+            written = 0
+            with open(piece, "wb") as out:
+                while written < max_bytes:
+                    block = fh.read(min(_HASH_CHUNK, max_bytes - written))
+                    if not block:
+                        break
+                    out.write(block)
+                    written += len(block)
+            pieces.append(piece)
+    return pieces
+
+
 def select_files(
     all_paths: list[str], split_globs: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -141,6 +206,25 @@ def select_files(
         else:
             bundled.append(path)
     return split, bundled
+
+
+def entry_pieces(entry: dict) -> list[dict]:
+    """Pieces of a ledger entry, oldest ledger shape included.
+
+    Entries written before file-splitting existed have no "pieces" list —
+    the whole file was one session — so they read as a single implicit
+    piece. That keeps everything already on Drive pullable.
+    """
+    pieces = entry.get("pieces")
+    if pieces:
+        return sorted(pieces, key=lambda piece: piece.get("name", ""))
+    return [{
+        "name": "aa",
+        "leaf": entry["leaf"],
+        "session_id": entry["session_id"],
+        "sha256": entry["sha256"],
+        "size": entry.get("size", 0),
+    }]
 
 
 def bundle_key(bundle_name: str) -> str:
@@ -203,6 +287,86 @@ def _get_passphrase() -> str:
             "  Losing this passphrase makes the uploaded data unrecoverable."
         )
     return passphrase
+
+
+def push_pieces(
+    local_path: Path,
+    base_leaf: str,
+    passphrase: str,
+    work_dir: Path,
+    chunk_size_mb: int,
+    credentials: str | None,
+    max_piece_bytes: int,
+    already: dict[str, dict] | None = None,
+    on_piece: "Callable[[dict], None] | None" = None,
+) -> dict:
+    """Split one file into sub-ceiling pieces and push each as its own session.
+
+    Each piece lands in its own folder under `base_leaf` ("…/003/aa"), so a
+    single manual download of `…/003/` brings back every piece, and each one
+    decrypts on its own with no session filtering. Reassembly is
+    `cat dec/*/result`, since the two-letter names sort into piece order.
+
+    `already` lets a resumed run skip pieces recorded by a previous attempt;
+    `on_piece` is called after each piece so the caller can persist progress
+    before the next upload starts.
+    """
+    whole_sha = sha256_file(local_path)
+    whole_size = local_path.stat().st_size
+    already = already or {}
+
+    pieces_dir = work_dir / "pieces"
+    pieces = split_into_pieces(local_path, pieces_dir, max_piece_bytes)
+    # The pieces hold every byte, so the download can go now rather than
+    # sitting alongside them for the whole upload.
+    local_path.unlink(missing_ok=True)
+
+    records: list[dict] = []
+    for piece in pieces:
+        name = piece.name
+        if name in already:
+            records.append(already[name])
+            piece.unlink(missing_ok=True)
+            print(f"    piece {name}: already pushed, skipping")
+            continue
+        piece_leaf = f"{base_leaf}/{name}"
+        session_id = str(uuid.uuid4())
+        try:
+            entry = push_one_file(
+                piece, piece_leaf, passphrase, work_dir,
+                chunk_size_mb, credentials, session_id,
+            )
+        except Exception:
+            # Chunks this piece already uploaded would be orphans: the retry
+            # mints a new session id and never reuses them. Finished pieces
+            # are deliberately left alone so the retry can skip them.
+            try:
+                removed = drive.delete_session_files(
+                    piece_leaf, session_id, credentials
+                )
+                if removed:
+                    print(f"    piece {name}: cleaned up {removed} "
+                          f"orphan chunk(s)")
+            except Exception as cleanup_exc:  # noqa: BLE001
+                print(f"    piece {name}: WARNING could not clean up "
+                      f"{session_id}: {cleanup_exc}")
+            raise
+        entry["name"] = name
+        piece.unlink(missing_ok=True)
+        records.append(entry)
+        print(f"    piece {name}: {entry['size'] / 1e9:.2f} GB, "
+              f"{entry['parts']} part(s)")
+        if on_piece:
+            on_piece(entry)
+
+    return {
+        "sha256": whole_sha,
+        "size": whole_size,
+        "piece_size_bytes": max_piece_bytes,
+        "pieces": records,
+        "original_name": local_path.name,
+        "pushed_at": _utc_now(),
+    }
 
 
 def push_one_file(
@@ -307,12 +471,24 @@ def cmd_push(args: argparse.Namespace) -> None:
 
     failures: list[str] = []
 
+    max_piece_bytes = args.max_piece_size * 1024 * 1024
+    partials = ledger.setdefault("partials", {})
+
     for index, repo_path in enumerate(todo, start=1):
         leaf = targets[repo_path]
-        session_id = str(uuid.uuid4())
         work_dir = Path(tempfile.mkdtemp(dir=args.work_dir or None))
+        # Pieces this file got through on an earlier attempt, so a resumed
+        # run re-uploads only what is missing instead of the whole archive.
+        done_pieces = dict(partials.get(repo_path, {}))
+
+        def _remember(piece_entry, _rp=repo_path):
+            partials.setdefault(_rp, {})[piece_entry["name"]] = piece_entry
+            save_ledger(lpath, ledger)
+
         try:
             print(f"[{index}/{len(todo)}] {repo_path} -> {leaf}")
+            if done_pieces:
+                print(f"    resuming: {len(done_pieces)} piece(s) already up")
             if is_bundle_key(repo_path):
                 staging = work_dir / args.bundle_name
                 staging.mkdir()
@@ -329,23 +505,23 @@ def cmd_push(args: argparse.Namespace) -> None:
                     )
                 )
                 shutil.rmtree(staging, ignore_errors=True)
-                entry = push_one_file(
-                    local, leaf, passphrase, work_dir, args.chunk_size,
-                    args.credentials, session_id,
-                )
-                entry["bundled_files"] = bundled_paths
             else:
                 local = _download_one(args.repo, args.repo_type, repo_path, work_dir)
-                entry = push_one_file(
-                    local, leaf, passphrase, work_dir, args.chunk_size,
-                    args.credentials, session_id,
-                )
+
+            entry = push_pieces(
+                local, leaf, passphrase, work_dir, args.chunk_size,
+                args.credentials, max_piece_bytes,
+                already=done_pieces, on_piece=_remember,
+            )
+            if is_bundle_key(repo_path):
+                entry["bundled_files"] = bundled_paths
 
             # Record before the next download so an interruption resumes here.
             ledger["entries"][repo_path] = entry
             ledger.get("failures", {}).pop(repo_path, None)
+            partials.pop(repo_path, None)
             save_ledger(lpath, ledger)
-            print(f"    ok  {entry['parts']} part(s)  "
+            print(f"    ok  {len(entry['pieces'])} piece(s)  "
                   f"sha256={entry['sha256'][:12]}...\n")
         except Exception as exc:  # noqa: BLE001 - one bad file must not end the run
             # A dropped connection on file 7 of 41 should cost that file, not
@@ -354,23 +530,16 @@ def cmd_push(args: argparse.Namespace) -> None:
             failures.append(repo_path)
             ledger.setdefault("failures", {})[repo_path] = {
                 "leaf": leaf,
-                "session_id": session_id,
                 "error": f"{type(exc).__name__}: {exc}",
                 "failed_at": _utc_now(),
+                "pieces_done": sorted(partials.get(repo_path, {})),
             }
             save_ledger(lpath, ledger)
             print(f"    FAILED  {type(exc).__name__}: {exc}")
-            # Chunks already uploaded under this session would otherwise be
-            # orphans: the retry mints a new session ID and never reuses them.
-            try:
-                removed = drive.delete_session_files(
-                    leaf, session_id, args.credentials
-                )
-                if removed:
-                    print(f"    cleaned up {removed} orphan chunk(s)")
-            except Exception as cleanup_exc:  # noqa: BLE001
-                print(f"    WARNING: could not clean up {session_id}: "
-                      f"{cleanup_exc}")
+            kept = sorted(partials.get(repo_path, {}))
+            if kept:
+                print(f"    keeping {len(kept)} finished piece(s) for the "
+                      f"retry: {', '.join(kept)}")
             print()
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -462,7 +631,12 @@ def cmd_pull(args: argparse.Namespace) -> None:
 
     for index, repo_path in enumerate(wanted, start=1):
         entry = entries[repo_path]
-        print(f"[{index}/{len(wanted)}] {entry['leaf']} -> {repo_path}")
+        pieces = entry_pieces(entry)
+        where = pieces[0]["leaf"] if len(pieces) == 1 else (
+            f"{pieces[0]['leaf'].rsplit('/', 1)[0]}/"
+            f"{{{','.join(pc['name'] for pc in pieces)}}}"
+        )
+        print(f"[{index}/{len(wanted)}] {where} -> {repo_path}")
         bundled = is_bundle_key(repo_path)
         dest = output / repo_path
         if not bundled and dest.exists() and not args.force:
@@ -471,22 +645,37 @@ def cmd_pull(args: argparse.Namespace) -> None:
 
         work_dir = Path(tempfile.mkdtemp(dir=args.work_dir or None))
         try:
-            # Several pushes share a folder, so the session ID is what
-            # selects this file's chunks out of the pile.
-            chunks = drive.download_from_drive(
-                entry["leaf"], work_dir, args.credentials,
-                session_id=entry["session_id"],
-            )
-            if not chunks:
-                raise ValueError(f"no chunks in Drive folder {entry['leaf']!r}")
-            joined = work_dir / "joined"
-            splitter.join_files(chunks, joined)
-            for chunk in chunks:
-                chunk.unlink(missing_ok=True)
-
             decrypted = work_dir / "decrypted"
-            crypto.decrypt_stream(joined, decrypted, passphrase)
-            joined.unlink(missing_ok=True)
+            for piece in entry_pieces(entry):
+                # Several pushes can share a folder, so the session ID is
+                # what selects this piece's chunks out of the pile.
+                chunks = drive.download_from_drive(
+                    piece["leaf"], work_dir, args.credentials,
+                    session_id=piece["session_id"],
+                )
+                if not chunks:
+                    raise ValueError(
+                        f"no chunks in Drive folder {piece['leaf']!r}"
+                    )
+                joined = work_dir / "joined"
+                splitter.join_files(chunks, joined)
+                for chunk in chunks:
+                    chunk.unlink(missing_ok=True)
+
+                plain = work_dir / "piece-plain"
+                crypto.decrypt_stream(joined, plain, passphrase)
+                joined.unlink(missing_ok=True)
+
+                got_piece = sha256_file(plain)
+                if got_piece != piece["sha256"]:
+                    raise ValueError(
+                        f"piece {piece.get('name', '?')} sha256 mismatch: "
+                        f"expected {piece['sha256']}, got {got_piece}"
+                    )
+                # Append in piece order; the names sort that way already.
+                with open(decrypted, "ab") as whole, open(plain, "rb") as part:
+                    shutil.copyfileobj(part, whole, _HASH_CHUNK)
+                plain.unlink(missing_ok=True)
 
             got = sha256_file(decrypted)
             if got != entry["sha256"]:
@@ -504,6 +693,12 @@ def cmd_pull(args: argparse.Namespace) -> None:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(decrypted), dest)
             print(f"    ok  sha256 verified -> {dest}\n")
+        except Exception as exc:  # noqa: BLE001 - one bad file must not end the pull
+            # Same reasoning as the push side: recovering 40 archives should
+            # not abort wholesale because one piece is missing or corrupt.
+            # KeyboardInterrupt stays a BaseException and still stops.
+            failures.append(repo_path)
+            print(f"    FAILED  {type(exc).__name__}: {exc}\n")
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -542,6 +737,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--split", metavar="<glob>", action="append", default=None,
                        help="Repo-path glob whose matches each get their own "
                             "leaf folder (repeatable; default: 'videos/*')")
+        p.add_argument("--max-piece-size", metavar="<MB>", type=int,
+                       default=DEFAULT_PIECE_MB,
+                       help=f"Split a file into pieces of at most this size "
+                            f"before encrypting (default: {DEFAULT_PIECE_MB}). "
+                            f"AES-GCM cannot encrypt more than "
+                            f"{AESGCM_MAX_BYTES // 1024 // 1024} MB at once, and "
+                            f"encrypt/decrypt hold about 3x a piece in memory")
         p.add_argument("--layout", metavar="<kind>", default=PER_FILE,
                        choices=list(LAYOUTS),
                        help=f"How to folder the chunks: '{PER_FILE}' (default) "

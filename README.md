@@ -227,6 +227,27 @@ No ledger lookup, no picking chunks apart, only 1–5 GB of local disk at a time
 
 `--layout shared` instead puts a whole directory's files in one folder (`videos/` holding all 40). Tidier in the Drive UI, but that folder then mixes every session's chunks, and `pull --from-dir` joins whatever it finds in a directory — so recovery needs `innout pull <session_id> --drive …` and the session IDs from the ledger.
 
+**Files are split before encryption.** innout's crypto reads a whole file into memory and calls `AESGCM.encrypt` once, which raises `OverflowError` above 2 GiB — 26 of Video-MME-v2's 40 archives are over it. `--max-piece-size` (default 1024 MB) cuts each file into pieces well under that ceiling, each pushed as its own session into its own subfolder:
+
+```
+Video-MME-v2/videos/003/     <- 003.zip, 3.43 GB
+├── aa/                      <- 1 GiB
+├── ab/
+├── ac/
+└── ad/                      <- 0.43 GB
+```
+
+One download of `videos/003/` still brings every piece, and the two-letter names sort into piece order, so recovery is one pull per piece and a `cat`:
+
+```bash
+for p in ./003/*/; do
+  innout pull --from-dir "$p" --output "./dec/$(basename "$p")"
+done
+cat ./dec/*/result > 003.zip
+```
+
+The default also caps memory: encrypt and decrypt hold the plaintext plus a copy of the ciphertext, so a 1 GiB piece needs ~3 GB rather than the ~6 GB a 2 GiB piece would.
+
 `--chunk-size` defaults to 512 MB here rather than 1800. A dropped connection costs at most one chunk of re-upload, so lower it further on an unreliable link.
 
 ```bash
