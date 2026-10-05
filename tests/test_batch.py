@@ -554,6 +554,48 @@ def test_cmd_push_bundles_small_files_into_one_leaf(tmp_path, monkeypatch):
     ]
 
 
+def test_cmd_push_bundle_excludes_hf_download_cache(tmp_path, monkeypatch):
+    """hf_hub_download drops .cache/huggingface into local_dir.
+
+    Regression: that bookkeeping got archived with the payload, so the
+    recovered tar carried a dozen .metadata files alongside the real files.
+    """
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    monkeypatch.setattr(
+        batch, "_list_repo_files", lambda repo_id, repo_type: ["eval.yaml"]
+    )
+
+    def _download_leaving_cache(repo_id, repo_type, repo_path, dest):
+        dest = Path(dest)
+        (dest / ".cache" / "huggingface" / "download").mkdir(parents=True)
+        (dest / ".cache" / "huggingface" / "download" / "eval.yaml.metadata").write_text("junk")
+        path = dest / repo_path
+        path.write_bytes(b"real payload")
+        return path
+
+    monkeypatch.setattr(batch, "_download_one", _download_leaving_cache)
+
+    archived: list[list[str]] = []
+
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
+                   credentials, session_id=None):
+        import tarfile
+        with tarfile.open(local_path, "r:gz") as tf:
+            archived.append(tf.getnames())
+        return _entry(leaf=leaf, original_name=local_path.name)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    batch.cmd_push(_push_args(led))
+
+    names = archived[0]
+    assert any(n.endswith("eval.yaml") for n in names), names
+    assert not any(".cache" in n for n in names), (
+        f"HF download cache leaked into the bundle: "
+        f"{[n for n in names if '.cache' in n]}"
+    )
+
+
 def test_cmd_push_gives_each_video_its_own_leaf(tmp_path, monkeypatch):
     monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
     led = tmp_path / "led.json"

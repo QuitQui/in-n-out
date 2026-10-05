@@ -318,6 +318,10 @@ def cmd_push(args: argparse.Namespace) -> None:
                 staging.mkdir()
                 for small in bundled_paths:
                     _download_one(args.repo, args.repo_type, small, staging)
+                # hf_hub_download leaves its own bookkeeping in
+                # <local_dir>/.cache/huggingface; archiving that would ship a
+                # dozen .metadata files as if they were part of the dataset.
+                shutil.rmtree(staging / ".cache", ignore_errors=True)
                 local = Path(
                     shutil.make_archive(
                         str(work_dir / args.bundle_name), "gztar",
