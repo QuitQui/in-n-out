@@ -205,17 +205,27 @@ uv run python -m innout.batch plan --repo MME-Benchmarks/Video-MME-v2 --drive-pa
 #   largest single file 5.09 GB -> peak working disk about 10.2 GB
 ```
 
-Each file's chunks go in the folder mirroring its path in the repo, so `videos/001.zip` … `videos/040.zip` all share one flat `videos/`. Files not matched by `--split` (default `videos/*`) are bundled into a single `annotations` session, so the small ones don't each cost a folder:
+`--layout per-file` (the default) gives each file its own folder under the path it has in the repo. Files not matched by `--split` (default `videos/*`) are bundled into a single `annotations` session, so the small ones don't each cost a folder:
 
 ```
 My Drive/Video-MME-v2/
 ├── annotations/     <- the 9 small files, as one tar.gz
-└── videos/          <- all 40 archives, told apart by session ID
-    ├── 3d0b5704-….part000   <- 001.zip
-    ├── 3d0b5704-….part001   <- 001.zip
-    ├── 615e9815-….part000   <- 002.zip
-    └── …
+└── videos/
+    ├── 001/         <- 001.zip, 8 chunks, decodable on its own
+    ├── 002/
+    └── … 040/
 ```
+
+**That layout is chosen for how the data comes back.** Each folder is a self-contained unit, so recovering one archive by hand is: download the folder from the Drive web UI, then
+
+```bash
+innout pull --from-dir ./001 --passphrase "…" --output ./out
+mv out/result 001.zip
+```
+
+No ledger lookup, no picking chunks apart, only 1–5 GB of local disk at a time — and since the chunk format never changed, **this works on an older `innout` too**, so the decode side needs no update.
+
+`--layout shared` instead puts a whole directory's files in one folder (`videos/` holding all 40). Tidier in the Drive UI, but that folder then mixes every session's chunks, and `pull --from-dir` joins whatever it finds in a directory — so recovery needs `innout pull <session_id> --drive …` and the session IDs from the ledger.
 
 `--chunk-size` defaults to 512 MB here rather than 1800. A dropped connection costs at most one chunk of re-upload, so lower it further on an unreliable link.
 

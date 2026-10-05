@@ -6,10 +6,18 @@ on disk simultaneously — roughly 4x the source size. This module walks the
 repo file by file instead, so peak disk stays at about 2x the *largest
 single file*, and records what it did so an interrupted run resumes.
 
-Each file's chunks go in the folder mirroring its path in the repo, so
-`videos/001.zip` ... `videos/040.zip` all share one flat `videos/`. Chunk
-filenames carry their session ID, which is what `pull` filters on to get one
-file back out of the pile.
+Layout (--layout) decides how chunks are foldered, and the choice is really
+about how the data gets pulled back:
+
+- "per-file" (default): one folder per file, "videos/001.zip" ->
+  "videos/001". Each folder is a self-contained decodable unit, so a manual
+  Drive download of one folder and `innout pull --from-dir` just works — no
+  ledger lookup, no picking chunks apart, and no need for this module on the
+  decode side at all.
+- "shared": a directory's files all go in one folder, so the 40 archives
+  share "videos/". Tidier in the Drive UI, but that folder then holds every
+  session's chunks mixed together, and `pull --from-dir` joins whatever it
+  finds in a directory — so decoding then needs a session-aware pull.
 
 Small files (anything not matched by --split) are bundled into a single
 tar.gz session so they do not each get a folder of their own.
@@ -44,6 +52,9 @@ _HASH_CHUNK = 4 * 1024 * 1024
 #: Leaf folder that collects every file --split does not match.
 BUNDLE_NAME = "annotations"
 _BUNDLE_PREFIX = "<bundle:"
+PER_FILE = "per-file"
+SHARED = "shared"
+LAYOUTS = (PER_FILE, SHARED)
 
 
 def _utc_now() -> str:
@@ -83,15 +94,33 @@ def leaf_dir(repo_path: str) -> str:
     return "/".join(segments)
 
 
-def assign_leaves(repo_paths: list[str], drive_parent: str) -> dict[str, str]:
-    """Map each repo path to the Drive folder its chunks belong in.
+def file_stem(repo_path: str) -> str:
+    """Final path segment without its extension: "videos/001.zip" -> "001"."""
+    tail = repo_path.rstrip("/").rsplit("/", 1)[-1]
+    stem = tail.rsplit(".", 1)[0] if "." in tail else tail
+    if not stem:
+        raise ValueError(f"Cannot derive a folder name from {repo_path!r}")
+    return stem
 
-    Several files intentionally share a folder; they are told apart by the
-    session ID in each chunk's filename, which is what `pull` filters on.
-    """
+
+def leaf_for(repo_path: str, layout: str = PER_FILE) -> str:
+    """Drive sub-path, below the parent, holding this file's chunks."""
+    if layout not in LAYOUTS:
+        raise ValueError(f"Unknown layout {layout!r}; expected one of {LAYOUTS}")
+    directory = leaf_dir(repo_path)
+    if layout == SHARED:
+        return directory
+    stem = file_stem(repo_path)
+    return f"{directory}/{stem}" if directory else stem
+
+
+def assign_leaves(
+    repo_paths: list[str], drive_parent: str, layout: str = PER_FILE
+) -> dict[str, str]:
+    """Map each repo path to the Drive folder its chunks belong in."""
     leaves: dict[str, str] = {}
     for repo_path in repo_paths:
-        sub = leaf_dir(repo_path)
+        sub = leaf_for(repo_path, layout)
         leaves[repo_path] = f"{drive_parent}/{sub}" if sub else drive_parent
     return leaves
 
@@ -246,7 +275,7 @@ def _list_repo_files(repo_id: str, repo_type: str) -> list[str]:
 def _resolve_targets(args: argparse.Namespace) -> tuple[dict[str, str], list[str]]:
     all_paths = _list_repo_files(args.repo, args.repo_type)
     split_paths, bundled_paths = select_files(all_paths, args.split)
-    targets = assign_leaves(split_paths, args.drive_parent)
+    targets = assign_leaves(split_paths, args.drive_parent, args.layout)
     if bundled_paths:
         targets[bundle_key(args.bundle_name)] = (
             f"{args.drive_parent}/{args.bundle_name}"
@@ -370,7 +399,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
         for sibling in info.siblings
     }
     split_paths, bundled_paths = select_files(list(sizes), args.split)
-    targets = assign_leaves(split_paths, args.drive_parent)
+    targets = assign_leaves(split_paths, args.drive_parent, args.layout)
     done = set(load_ledger(ledger_path(args.repo, args.ledger)).get("entries", {}))
 
     print(f"{args.repo} ({args.repo_type}) -> Drive folder {args.drive_parent!r}\n")
@@ -509,6 +538,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--split", metavar="<glob>", action="append", default=None,
                        help="Repo-path glob whose matches each get their own "
                             "leaf folder (repeatable; default: 'videos/*')")
+        p.add_argument("--layout", metavar="<kind>", default=PER_FILE,
+                       choices=list(LAYOUTS),
+                       help=f"How to folder the chunks: '{PER_FILE}' (default) "
+                            f"gives each file its own folder, so one manually "
+                            f"downloaded folder decodes on its own; "
+                            f"'{SHARED}' puts a directory's files together, "
+                            f"which needs a session-aware pull")
         p.add_argument("--bundle-name", metavar="<name>", default=BUNDLE_NAME,
                        help=f"Leaf folder for all remaining small files "
                             f"(default: {BUNDLE_NAME})")

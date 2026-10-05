@@ -15,7 +15,9 @@ from innout.batch import (
     build_parser,
     bundle_key,
     is_bundle_key,
+    file_stem,
     leaf_dir,
+    leaf_for,
     ledger_path,
     load_ledger,
     pending_entries,
@@ -89,25 +91,70 @@ def test_leaf_dir_rejects_dot_segments():
             leaf_dir(bad)
 
 
-def test_assign_leaves_puts_every_video_in_one_flat_folder():
-    """40 archives share Video-MME-v2/videos rather than 40 sibling folders."""
+def test_file_stem_drops_the_extension():
+    assert file_stem("videos/001.zip") == "001"
+    assert file_stem("test.parquet") == "test"
+    assert file_stem("a/b/c.tar.gz") == "c.tar"
+    assert file_stem("README") == "README"
+
+
+def test_file_stem_tolerates_a_trailing_slash():
+    assert file_stem("videos/") == "videos"
+
+
+def test_file_stem_rejects_a_path_with_no_name():
+    with pytest.raises(ValueError, match="Cannot derive a folder name"):
+        file_stem("/")
+
+
+def test_leaf_for_per_file_gives_each_file_its_own_folder():
+    """The decode-side default: one downloaded folder decodes on its own."""
+    assert leaf_for("videos/001.zip") == "videos/001"
+    assert leaf_for("videos/040.zip") == "videos/040"
+    assert leaf_for("big.zip") == "big"
+
+
+def test_leaf_for_shared_puts_a_directory_together():
+    assert leaf_for("videos/001.zip", "shared") == "videos"
+    assert leaf_for("videos/040.zip", "shared") == "videos"
+
+
+def test_leaf_for_rejects_an_unknown_layout():
+    with pytest.raises(ValueError, match="Unknown layout"):
+        leaf_for("videos/001.zip", "sideways")
+
+
+def test_assign_leaves_per_file_is_the_default():
+    """Each folder is a self-contained unit for a manual Drive download."""
     paths = ["videos/001.zip", "videos/002.zip", "videos/040.zip"]
     assert assign_leaves(paths, "Video-MME-v2") == {
-        "videos/001.zip": "Video-MME-v2/videos",
-        "videos/002.zip": "Video-MME-v2/videos",
-        "videos/040.zip": "Video-MME-v2/videos",
+        "videos/001.zip": "Video-MME-v2/videos/001",
+        "videos/002.zip": "Video-MME-v2/videos/002",
+        "videos/040.zip": "Video-MME-v2/videos/040",
     }
 
 
-def test_assign_leaves_top_level_file_goes_in_the_parent():
+def test_assign_leaves_shared_collapses_to_one_folder():
+    paths = ["videos/001.zip", "videos/002.zip"]
+    assert assign_leaves(paths, "Video-MME-v2", "shared") == {
+        "videos/001.zip": "Video-MME-v2/videos",
+        "videos/002.zip": "Video-MME-v2/videos",
+    }
+
+
+def test_assign_leaves_top_level_file_gets_its_own_folder():
     assert assign_leaves(["big.zip"], "Video-MME-v2") == {
+        "big.zip": "Video-MME-v2/big",
+    }
+    # shared has nothing to group by, so it lands in the parent itself
+    assert assign_leaves(["big.zip"], "Video-MME-v2", "shared") == {
         "big.zip": "Video-MME-v2",
     }
 
 
 def test_assign_leaves_preserves_deeper_structure():
     assert assign_leaves(["videos/hd/001.zip"], "P") == {
-        "videos/hd/001.zip": "P/videos/hd",
+        "videos/hd/001.zip": "P/videos/hd/001",
     }
 
 
@@ -430,7 +477,7 @@ def test_cmd_push_resumes_and_skips_done_entries(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(batch, "push_one_file", _fake_push)
     batch.cmd_push(_push_args(led))
 
-    assert pushed == ["P/videos"], "already-pushed file must be skipped"
+    assert pushed == ["P/videos/002"], "already-pushed file must be skipped"
     assert set(load_ledger(led)["entries"]) == {"videos/001.zip", "videos/002.zip"}
     assert "1 already pushed, 1 to go" in capsys.readouterr().out
 
@@ -498,14 +545,16 @@ def test_cmd_push_bundles_small_files_into_one_leaf(tmp_path, monkeypatch):
     monkeypatch.setattr(batch, "push_one_file", _fake_push)
     batch.cmd_push(_push_args(led, parent="Video-MME-v2"))
 
-    assert sorted(leaves) == ["Video-MME-v2/annotations", "Video-MME-v2/videos"]
+    assert sorted(leaves) == [
+        "Video-MME-v2/annotations", "Video-MME-v2/videos/001",
+    ]
     entries = load_ledger(led)["entries"]
     assert sorted(entries["<bundle:annotations>"]["bundled_files"]) == [
         "eval.yaml", "test.parquet",
     ]
 
 
-def test_cmd_push_all_videos_share_one_leaf(tmp_path, monkeypatch):
+def test_cmd_push_gives_each_video_its_own_leaf(tmp_path, monkeypatch):
     monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
     led = tmp_path / "led.json"
     monkeypatch.setattr(
@@ -524,8 +573,10 @@ def test_cmd_push_all_videos_share_one_leaf(tmp_path, monkeypatch):
     monkeypatch.setattr(batch, "push_one_file", _fake_push)
     batch.cmd_push(_push_args(led, parent="Video-MME-v2"))
 
-    assert {leaf for leaf, _ in seen} == {"Video-MME-v2/videos"}
-    # Distinct session ids are the only thing keeping them apart in there.
+    assert {leaf for leaf, _ in seen} == {
+        "Video-MME-v2/videos/001", "Video-MME-v2/videos/002",
+        "Video-MME-v2/videos/003",
+    }
     session_ids = [sid for _, sid in seen]
     assert len(set(session_ids)) == 3
     assert all(sid for sid in session_ids)
@@ -595,7 +646,7 @@ def test_cmd_push_cleans_up_orphan_chunks_after_a_failure(tmp_path, monkeypatch)
 
     assert len(cleaned) == 1
     leaf, session_id = cleaned[0]
-    assert leaf == "P/videos"
+    assert leaf == "P/videos/001"
     # The id handed to cleanup is the one the push used, not a fresh one.
     assert session_id == load_ledger(led)["failures"]["videos/001.zip"]["session_id"]
 
