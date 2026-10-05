@@ -73,19 +73,94 @@ def _get_service(credentials_file: str | None = None) -> Resource:
     return build("drive", "v3", credentials=creds)
 
 
-def _get_or_create_folder(service, folder_name: str) -> str:
-    safe_name = folder_name.replace("'", "\\'")
+_FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def _escape_query_value(value: str) -> str:
+    """Escape a value for interpolation into a single-quoted Drive query.
+
+    A literal backslash or apostrophe in a folder name would otherwise
+    terminate the quoted string and corrupt the query.
+    """
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _split_folder_path(folder_name: str) -> list[str]:
+    """Split a slash-separated Drive folder path into its segments.
+
+    Collapses repeated and trailing slashes, so "a//b/" == "a/b". Rejects
+    "." and ".." segments, which mean nothing in Drive and would otherwise
+    become folders literally named "." or "..".
+    """
+    segments = [s for s in folder_name.split("/") if s]
+    if not segments:
+        raise ValueError(f"Invalid Drive folder path: {folder_name!r}")
+    for segment in segments:
+        if segment in (".", ".."):
+            raise ValueError(
+                f"Invalid Drive folder path {folder_name!r}: "
+                f"segment {segment!r} is not allowed"
+            )
+    return segments
+
+
+def _find_child_folder(service, name: str, parent_id: str) -> str | None:
+    """Return the ID of folder `name` directly inside `parent_id`, else None.
+
+    Scoping each lookup to its parent is what makes nested paths safe: a
+    folder called "videos-001" elsewhere in the Drive can never match.
+    """
     query = (
-        f"name='{safe_name}' and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
+        f"name='{_escape_query_value(name)}' and "
+        f"'{_escape_query_value(parent_id)}' in parents and "
+        f"mimeType='{_FOLDER_MIME}' and trashed=false"
     )
     results = service.files().list(q=query, fields="files(id, name)").execute()
     files = results.get("files", [])
-    if files:
-        return files[0]["id"]
-    meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
-    folder = service.files().create(body=meta, fields="id").execute()
-    return folder["id"]
+    return files[0]["id"] if files else None
+
+
+def _resolve_folder_path(service, folder_name: str) -> str | None:
+    """Resolve an existing slash-separated folder path to its ID, else None.
+
+    Read-only counterpart of _get_or_create_folder, so a pull against a
+    mistyped path fails loudly instead of silently creating empty folders.
+    """
+    parent_id = "root"
+    for segment in _split_folder_path(folder_name):
+        child_id = _find_child_folder(service, segment, parent_id)
+        if child_id is None:
+            return None
+        parent_id = child_id
+    return parent_id
+
+
+def _get_or_create_folder(service, folder_name: str) -> str:
+    """Resolve a slash-separated folder path, creating any missing levels.
+
+    "VideoMME-v2/videos-001" resolves to the `videos-001` folder nested
+    inside `VideoMME-v2`, creating either if absent, and returns the ID of
+    the leaf — the folder chunks are uploaded into. One push per leaf
+    folder: a pull joins *every* file it finds there, so two sessions
+    sharing a folder would decrypt to garbage.
+
+    Note: the OAuth scope is drive.file, so only folders this app created
+    are visible. A `VideoMME-v2` folder made by hand in the Drive UI is
+    invisible here and a same-named sibling gets created instead.
+    """
+    parent_id = "root"
+    for segment in _split_folder_path(folder_name):
+        child_id = _find_child_folder(service, segment, parent_id)
+        if child_id is not None:
+            parent_id = child_id
+            continue
+        meta = {
+            "name": segment,
+            "mimeType": _FOLDER_MIME,
+            "parents": [parent_id],
+        }
+        parent_id = service.files().create(body=meta, fields="id").execute()["id"]
+    return parent_id
 
 
 def upload_to_drive(
@@ -93,7 +168,11 @@ def upload_to_drive(
     folder_name: str,
     credentials_file: str | None = None,
 ) -> str:
-    """Upload chunks to a Google Drive folder, returns the folder URL."""
+    """Upload chunks to a Google Drive folder, returns the folder URL.
+
+    folder_name may be a nested path ("VideoMME-v2/videos-001"); missing
+    levels are created. Give each push its own leaf folder.
+    """
     from googleapiclient.http import MediaFileUpload
 
     service = _get_service(credentials_file)
@@ -118,24 +197,21 @@ def download_from_drive(
 ) -> list[Path]:
     """Download all chunk files from a Google Drive folder into dest_dir.
 
+    folder_name may be a nested path ("VideoMME-v2/videos-001"). Every file
+    in the leaf folder is downloaded and later joined, so the folder must
+    hold exactly one push's chunks.
+
     Returns the downloaded paths sorted by name (preserves chunk order).
     """
     from googleapiclient.http import MediaIoBaseDownload
 
     service = _get_service(credentials_file)
 
-    safe_name = folder_name.replace("'", "\\'")
-    query = (
-        f"name='{safe_name}' and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    folders = results.get("files", [])
-    if not folders:
+    folder_id = _resolve_folder_path(service, folder_name)
+    if folder_id is None:
         raise ValueError(f"Drive folder not found: {folder_name!r}")
-    folder_id = folders[0]["id"]
 
-    query = f"'{folder_id}' in parents and trashed=false"
+    query = f"'{_escape_query_value(folder_id)}' in parents and trashed=false"
     results = service.files().list(
         q=query, fields="files(id, name)", orderBy="name"
     ).execute()

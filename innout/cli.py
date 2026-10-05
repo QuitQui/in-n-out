@@ -147,7 +147,12 @@ def build_parser() -> argparse.ArgumentParser:
     source_group.add_argument("--hf", metavar="org/repo", help="HuggingFace repo to push")
     dest_group = push_parser.add_mutually_exclusive_group()
     dest_group.add_argument("--server", metavar="<url>", help="innout server URL")
-    dest_group.add_argument("--drive", metavar="<folder>", help="Google Drive folder name")
+    dest_group.add_argument(
+        "--drive", metavar="<folder>",
+        help="Google Drive destination folder; nested paths are created as "
+             "needed, e.g. --drive 'VideoMME-v2/videos-001'. Use a separate "
+             "folder per push — pull joins every file in the folder",
+    )
     push_parser.add_argument(
         "--credentials",
         metavar="<path>",
@@ -194,7 +199,9 @@ def build_parser() -> argparse.ArgumentParser:
     source_group_pull = pull_parser.add_mutually_exclusive_group()
     source_group_pull.add_argument("--server", metavar="<url>", help="innout server URL")
     source_group_pull.add_argument(
-        "--drive", metavar="<folder>", help="Google Drive folder name to download from"
+        "--drive", metavar="<folder>",
+        help="Google Drive folder to download from; nested paths supported, "
+             "e.g. --drive 'VideoMME-v2/videos-001'",
     )
     source_group_pull.add_argument(
         "--from-dir", metavar="<path>",
