@@ -1,4 +1,4 @@
-"""Batch push of a large HuggingFace repo to Drive, one file per leaf folder.
+"""Batch push of a large HuggingFace repo to Drive, one file at a time.
 
 A 100 GB dataset cannot go through `innout push --hf` in one shot: the
 pipeline would need the snapshot, its tar.gz, the ciphertext and the chunks
@@ -6,11 +6,18 @@ on disk simultaneously — roughly 4x the source size. This module walks the
 repo file by file instead, so peak disk stays at about 2x the *largest
 single file*, and records what it did so an interrupted run resumes.
 
-Each file lands in its own leaf folder, because `pull` joins every file it
-finds in a folder — two sessions sharing one folder decrypt to garbage.
+Each file's chunks go in the folder mirroring its path in the repo, so
+`videos/001.zip` ... `videos/040.zip` all share one flat `videos/`. Chunk
+filenames carry their session ID, which is what `pull` filters on to get one
+file back out of the pile.
 
 Small files (anything not matched by --split) are bundled into a single
 tar.gz session so they do not each get a folder of their own.
+
+A file that fails even after the Drive layer's retries is recorded under
+`failures`, its half-uploaded chunks are deleted so they do not linger as
+orphans, and the run continues — on a flaky link one bad moment should cost
+that file, not the hours already spent.
 
 The passphrase is read only from $INNOUT_PASSPHRASE: passing it as an
 argument would expose it in shell history and in `ps` output. It is never
@@ -385,8 +392,12 @@ def cmd_plan(args: argparse.Namespace) -> None:
             print(f"                        {sizes.get(small, 0) / 1e9:7.3f} GB  {small}")
 
     count = len(targets) + (1 if bundled_paths else 0)
+    folders = set(targets.values())
+    if bundled_paths:
+        folders.add(f"{args.drive_parent}/{args.bundle_name}")
     largest = max(sizes.values()) if sizes else 0
-    print(f"\n  {count} leaf folder(s), {total / 1e9:.2f} GB total")
+    print(f"\n  {count} target(s) across {len(folders)} folder(s), "
+          f"{total / 1e9:.2f} GB total")
     print(f"  largest single file {largest / 1e9:.2f} GB "
           f"-> peak working disk about {2 * largest / 1e9:.1f} GB")
     print(f"  {len(done)} of {count} already pushed")
