@@ -91,8 +91,12 @@ def cmd_pull(args: argparse.Namespace) -> None:
         from innout import drive
         tmpdir = tempfile.mkdtemp()
         try:
+            # A folder may hold several pushes; the positional session id
+            # picks one out. Omitted, download_from_drive accepts a
+            # single-push folder and refuses an ambiguous one.
             chunks = drive.download_from_drive(
-                args.drive, Path(tmpdir), getattr(args, "credentials", None)
+                args.drive, Path(tmpdir), getattr(args, "credentials", None),
+                session_id=args.session_id,
             )
             if not chunks:
                 raise SystemExit(f"error: no files found in Drive folder {args.drive!r}")
@@ -194,7 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
     pull_parser = subparsers.add_parser("pull", help="Download and decrypt data")
     pull_parser.add_argument(
         "session_id", metavar="<session_id>", nargs="?", default=None,
-        help="Session ID returned by push (required with --server)",
+        help="Session ID returned by push. Required with --server; with "
+             "--drive it selects one push out of a folder holding several",
     )
     source_group_pull = pull_parser.add_mutually_exclusive_group()
     source_group_pull.add_argument("--server", metavar="<url>", help="innout server URL")

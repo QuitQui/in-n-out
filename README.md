@@ -163,9 +163,17 @@ innout pull \
 
 `--drive` and `--server` are mutually exclusive. The Drive folder must match the one used during `push`.
 
-Nested paths work on both sides: `--drive "VideoMME-v2/videos-001"` creates (on push) or walks (on pull) each level, matching every folder *within its parent* rather than by name across the whole Drive.
+Nested paths work on both sides: `--drive "Video-MME-v2/videos"` creates (on push) or walks (on pull) each level, matching every folder *within its parent* rather than by name across the whole Drive.
 
-**One push per folder.** Pull joins every file it finds in the folder, so two sessions sharing a folder decrypt to garbage. Give each push its own leaf.
+**Several pushes may share a folder.** Chunk filenames carry their session ID, so pass the session ID to pull one of them out:
+
+```bash
+innout pull 87be1df4-571f-4e47-903a-a31e0c1be10b --drive "Video-MME-v2/videos" ...
+```
+
+Omit it and a single-push folder still works as before, while a folder holding several refuses rather than joining them into garbage — it lists the session IDs it found.
+
+Every Drive call retries transient failures (dropped connections, rate limits, 5xx) with exponential backoff and jitter. `googleapiclient`'s own `num_retries` does not cover this: it only guards the request that *opens* a resumable upload, not the PUTs carrying the bytes, so a connection dropped mid-chunk used to abort the whole transfer. Listings are paginated, because Drive silently caps a listing at 100 files and a truncated chunk list joins into an undecryptable blob.
 
 ### Pull from a manually downloaded directory
 
@@ -192,38 +200,44 @@ If the original source was a directory, the output is `<name>.tar` (gzip already
 
 ```bash
 # What would happen, and what it costs — no transfer.
-uv run python -m innout.batch plan --repo MME-Benchmarks/Video-MME-v2 --drive-parent VideoMME-v2
+uv run python -m innout.batch plan --repo MME-Benchmarks/Video-MME-v2 --drive-parent Video-MME-v2
 #   41 leaf folder(s), 105.20 GB total
 #   largest single file 5.09 GB -> peak working disk about 10.2 GB
 ```
 
-Files matched by `--split` (default `videos/*`) each get their own leaf folder; everything else is bundled into one `annotations` session, so small files don't each cost a folder:
+Each file's chunks go in the folder mirroring its path in the repo, so `videos/001.zip` … `videos/040.zip` all share one flat `videos/`. Files not matched by `--split` (default `videos/*`) are bundled into a single `annotations` session, so the small ones don't each cost a folder:
 
 ```
-My Drive/VideoMME-v2/
+My Drive/Video-MME-v2/
 ├── annotations/     <- the 9 small files, as one tar.gz
-├── videos-001/
-├── videos-002/
-└── ... videos-040/
+└── videos/          <- all 40 archives, told apart by session ID
+    ├── 3d0b5704-….part000   <- 001.zip
+    ├── 3d0b5704-….part001   <- 001.zip
+    ├── 615e9815-….part000   <- 002.zip
+    └── …
 ```
+
+`--chunk-size` defaults to 512 MB here rather than 1800. A dropped connection costs at most one chunk of re-upload, so lower it further on an unreliable link.
 
 ```bash
 # The passphrase comes only from the environment — never an argument,
 # which would leave it in shell history and in `ps` output.
 read -rs INNOUT_PASSPHRASE && export INNOUT_PASSPHRASE
 
-uv run python -m innout.batch push --repo MME-Benchmarks/Video-MME-v2 --drive-parent VideoMME-v2
+uv run python -m innout.batch push --repo MME-Benchmarks/Video-MME-v2 --drive-parent Video-MME-v2
 ```
 
 Interrupt it and re-run the same command: already-pushed files are skipped. Progress lives in a ledger at `~/.innout_batches/<repo>.json`, written after each file, which maps Drive folders back to original filenames and records each file's sha256.
+
+A file that fails even after retries is recorded under `failures`, its half-uploaded chunks are deleted so they don't linger as orphans, and the run moves to the next file — one bad moment costs that file, not the hours already spent. The command exits non-zero and names what to retry; re-running picks up exactly those.
 
 **Keep the ledger and the passphrase.** The passphrase is never stored; without it the uploaded data cannot be decrypted.
 
 ```bash
 uv run python -m innout.batch pull --repo MME-Benchmarks/Video-MME-v2 --output ./recovered
-# [ 1/41] VideoMME-v2/annotations -> <bundle:annotations>
+# [ 1/41] Video-MME-v2/annotations -> <bundle:annotations>
 #     ok  sha256 verified -> annotations.tar  (extract with: tar -xf annotations.tar)
-# [ 2/41] VideoMME-v2/videos-001 -> videos/001.zip
+# [ 2/41] Video-MME-v2/videos -> videos/001.zip
 #     ok  sha256 verified -> recovered/videos/001.zip
 ```
 

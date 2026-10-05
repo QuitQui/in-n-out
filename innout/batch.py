@@ -55,38 +55,37 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def leaf_name(repo_path: str) -> str:
-    """Turn a repo-relative path into a Drive folder name.
+def leaf_dir(repo_path: str) -> str:
+    """Drive sub-path holding this file's chunks: the file's own directory.
 
-    "videos/001.zip" -> "videos-001". Slashes become dashes so the whole
-    path stays visible in a flat folder name, and the extension is dropped
-    because the folder holds chunks, not the file itself.
+    "videos/001.zip" -> "videos", so all 40 video archives share one flat
+    `videos/` folder mirroring the repo layout, rather than 40 sibling
+    folders cluttering the parent. Chunk filenames carry their session ID,
+    so pushes sharing a folder stay separable on the way back out.
+
+    A top-level file returns "" — its chunks go straight in the parent.
     """
-    tail = repo_path.rsplit("/", 1)[-1]
-    stem = repo_path.rsplit(".", 1)[0] if "." in tail else repo_path
-    name = stem.strip("/").replace("/", "-")
-    if not name:
-        raise ValueError(f"Cannot derive a folder name from {repo_path!r}")
-    return name
+    head, _, _ = repo_path.rpartition("/")
+    segments = [s for s in head.split("/") if s]
+    for segment in segments:
+        if segment in (".", ".."):
+            raise ValueError(
+                f"Invalid repo path {repo_path!r}: "
+                f"segment {segment!r} is not allowed"
+            )
+    return "/".join(segments)
 
 
 def assign_leaves(repo_paths: list[str], drive_parent: str) -> dict[str, str]:
-    """Map each repo path to its full nested Drive path, rejecting collisions.
+    """Map each repo path to the Drive folder its chunks belong in.
 
-    "videos/001.zip" and "videos-001.zip" both slugify to "videos-001";
-    silently merging them into one folder would corrupt both uploads.
+    Several files intentionally share a folder; they are told apart by the
+    session ID in each chunk's filename, which is what `pull` filters on.
     """
     leaves: dict[str, str] = {}
-    seen: dict[str, str] = {}
     for repo_path in repo_paths:
-        name = leaf_name(repo_path)
-        if name in seen:
-            raise ValueError(
-                f"Drive folder name collision: {repo_path!r} and "
-                f"{seen[name]!r} both map to {name!r}. Rename or exclude one."
-            )
-        seen[name] = repo_path
-        leaves[repo_path] = f"{drive_parent}/{name}"
+        sub = leaf_dir(repo_path)
+        leaves[repo_path] = f"{drive_parent}/{sub}" if sub else drive_parent
     return leaves
 
 
@@ -177,15 +176,20 @@ def push_one_file(
     work_dir: Path,
     chunk_size_mb: int,
     credentials: str | None,
+    session_id: str | None = None,
 ) -> dict:
     """Encrypt, split and upload one local file, freeing disk as it goes.
 
     Each intermediate is deleted as soon as the next one exists, so peak
     usage stays near 2x the file rather than 4x.
+
+    The caller may supply `session_id` so it can clean up the chunks of a
+    failed upload — which it cannot do for an ID generated in here and lost
+    with the exception.
     """
     size = local_path.stat().st_size
     sha = sha256_file(local_path)
-    session_id = str(uuid.uuid4())
+    session_id = session_id or str(uuid.uuid4())
 
     encrypted = work_dir / f"{session_id}.enc"
     crypto.encrypt_stream(local_path, encrypted, passphrase)
@@ -265,8 +269,11 @@ def cmd_push(args: argparse.Namespace) -> None:
     print(f"{len(ledger['entries'])} already pushed, {len(todo)} to go.")
     print(f"Ledger: {lpath}\n")
 
+    failures: list[str] = []
+
     for index, repo_path in enumerate(todo, start=1):
         leaf = targets[repo_path]
+        session_id = str(uuid.uuid4())
         work_dir = Path(tempfile.mkdtemp(dir=args.work_dir or None))
         try:
             print(f"[{index}/{len(todo)}] {repo_path} -> {leaf}")
@@ -284,26 +291,58 @@ def cmd_push(args: argparse.Namespace) -> None:
                 shutil.rmtree(staging, ignore_errors=True)
                 entry = push_one_file(
                     local, leaf, passphrase, work_dir, args.chunk_size,
-                    args.credentials,
+                    args.credentials, session_id,
                 )
                 entry["bundled_files"] = bundled_paths
             else:
                 local = _download_one(args.repo, args.repo_type, repo_path, work_dir)
                 entry = push_one_file(
                     local, leaf, passphrase, work_dir, args.chunk_size,
-                    args.credentials,
+                    args.credentials, session_id,
                 )
 
             # Record before the next download so an interruption resumes here.
             ledger["entries"][repo_path] = entry
+            ledger.get("failures", {}).pop(repo_path, None)
             save_ledger(lpath, ledger)
             print(f"    ok  {entry['parts']} part(s)  "
                   f"sha256={entry['sha256'][:12]}...\n")
+        except Exception as exc:  # noqa: BLE001 - one bad file must not end the run
+            # A dropped connection on file 7 of 41 should cost that file, not
+            # the hours already spent. KeyboardInterrupt/SystemExit are
+            # BaseExceptions and still stop everything, as they should.
+            failures.append(repo_path)
+            ledger.setdefault("failures", {})[repo_path] = {
+                "leaf": leaf,
+                "session_id": session_id,
+                "error": f"{type(exc).__name__}: {exc}",
+                "failed_at": _utc_now(),
+            }
+            save_ledger(lpath, ledger)
+            print(f"    FAILED  {type(exc).__name__}: {exc}")
+            # Chunks already uploaded under this session would otherwise be
+            # orphans: the retry mints a new session ID and never reuses them.
+            try:
+                removed = drive.delete_session_files(
+                    leaf, session_id, args.credentials
+                )
+                if removed:
+                    print(f"    cleaned up {removed} orphan chunk(s)")
+            except Exception as cleanup_exc:  # noqa: BLE001
+                print(f"    WARNING: could not clean up {session_id}: "
+                      f"{cleanup_exc}")
+            print()
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
     print(f"Done. {len(ledger['entries'])}/{len(targets)} targets pushed.")
     print(f"Ledger: {lpath} — keep it, it maps Drive folders back to filenames.")
+    if failures:
+        print(f"\n{len(failures)} target(s) failed; re-run the same command to "
+              f"retry just these:")
+        for repo_path in failures:
+            print(f"  {repo_path}")
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +427,12 @@ def cmd_pull(args: argparse.Namespace) -> None:
 
         work_dir = Path(tempfile.mkdtemp(dir=args.work_dir or None))
         try:
-            chunks = drive.download_from_drive(entry["leaf"], work_dir, args.credentials)
+            # Several pushes share a folder, so the session ID is what
+            # selects this file's chunks out of the pile.
+            chunks = drive.download_from_drive(
+                entry["leaf"], work_dir, args.credentials,
+                session_id=entry["session_id"],
+            )
             if not chunks:
                 raise ValueError(f"no chunks in Drive folder {entry['leaf']!r}")
             joined = work_dir / "joined"
@@ -461,8 +505,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Ledger JSON (default: ~/.innout_batches/<repo>.json)")
         p.add_argument("--credentials", metavar="<path>", default=None,
                        help="OAuth client-secrets JSON for Drive")
-        p.add_argument("--chunk-size", metavar="<MB>", type=int, default=1800,
-                       help="Chunk size in MB (default: 1800)")
+        p.add_argument("--chunk-size", metavar="<MB>", type=int, default=512,
+                       help="Chunk size in MB (default: 512). A dropped "
+                            "connection costs at most one chunk of re-upload, "
+                            "so lower it on an unreliable link")
         p.add_argument("--work-dir", metavar="<dir>", default=None,
                        help="Where to stage downloads and chunks "
                             "(default: system temp)")

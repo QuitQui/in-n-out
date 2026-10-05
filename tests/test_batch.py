@@ -3,6 +3,7 @@
 import hashlib
 import json
 import shutil
+import ssl
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +15,7 @@ from innout.batch import (
     build_parser,
     bundle_key,
     is_bundle_key,
-    leaf_name,
+    leaf_dir,
     ledger_path,
     load_ledger,
     pending_entries,
@@ -65,39 +66,49 @@ def _stub_download(repo_id, repo_type, repo_path, dest):
 # leaf_name / assign_leaves
 # ---------------------------------------------------------------------------
 
-def test_leaf_name_flattens_path_and_drops_extension():
-    assert leaf_name("videos/001.zip") == "videos-001"
-    assert leaf_name("test.parquet") == "test"
-    assert leaf_name("a/b/c.tar.gz") == "a-b-c.tar"
+def test_leaf_dir_mirrors_the_repo_directory():
+    """The folder is the file's directory, so videos stay together."""
+    assert leaf_dir("videos/001.zip") == "videos"
+    assert leaf_dir("videos/040.zip") == "videos"
+    assert leaf_dir("a/b/c.tar.gz") == "a/b"
 
 
-def test_leaf_name_keeps_dotless_names_intact():
-    """A path whose last segment has no extension must keep that segment."""
-    assert leaf_name("videos/001") == "videos-001"
-    assert leaf_name("README") == "README"
+def test_leaf_dir_of_a_top_level_file_is_empty():
+    assert leaf_dir("test.parquet") == ""
+    assert leaf_dir("README") == ""
 
 
-def test_leaf_name_ignores_dots_in_parent_dirs():
-    """Only an extension on the final segment is stripped."""
-    assert leaf_name("v1.0/data") == "v1.0-data"
+def test_leaf_dir_collapses_redundant_slashes():
+    assert leaf_dir("videos//001.zip") == "videos"
+    assert leaf_dir("/videos/001.zip") == "videos"
 
 
-def test_leaf_name_rejects_unusable_path():
-    with pytest.raises(ValueError, match="Cannot derive a folder name"):
-        leaf_name("/")
+def test_leaf_dir_rejects_dot_segments():
+    for bad in ("../secrets/001.zip", "videos/../001.zip"):
+        with pytest.raises(ValueError, match="is not allowed"):
+            leaf_dir(bad)
 
 
-def test_assign_leaves_nests_under_parent():
-    assert assign_leaves(["videos/001.zip", "videos/002.zip"], "VideoMME-v2") == {
-        "videos/001.zip": "VideoMME-v2/videos-001",
-        "videos/002.zip": "VideoMME-v2/videos-002",
+def test_assign_leaves_puts_every_video_in_one_flat_folder():
+    """40 archives share Video-MME-v2/videos rather than 40 sibling folders."""
+    paths = ["videos/001.zip", "videos/002.zip", "videos/040.zip"]
+    assert assign_leaves(paths, "Video-MME-v2") == {
+        "videos/001.zip": "Video-MME-v2/videos",
+        "videos/002.zip": "Video-MME-v2/videos",
+        "videos/040.zip": "Video-MME-v2/videos",
     }
 
 
-def test_assign_leaves_rejects_collisions():
-    """Two paths slugifying to one folder would silently corrupt both pushes."""
-    with pytest.raises(ValueError, match="collision"):
-        assign_leaves(["videos/001.zip", "videos-001.zip"], "parent")
+def test_assign_leaves_top_level_file_goes_in_the_parent():
+    assert assign_leaves(["big.zip"], "Video-MME-v2") == {
+        "big.zip": "Video-MME-v2",
+    }
+
+
+def test_assign_leaves_preserves_deeper_structure():
+    assert assign_leaves(["videos/hd/001.zip"], "P") == {
+        "videos/hd/001.zip": "P/videos/hd",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +370,7 @@ def test_main_defaults_split_to_videos_and_parent_to_repo_name(monkeypatch):
     assert captured["split"] == ["videos/*"]
     assert captured["drive_parent"] == "Video-MME-v2"
     assert captured["repo_type"] == "dataset"
-    assert captured["chunk_size"] == 1800
+    assert captured["chunk_size"] == 512
 
 
 def test_main_respects_explicit_parent_and_split(monkeypatch):
@@ -411,14 +422,15 @@ def test_cmd_push_resumes_and_skips_done_entries(tmp_path, monkeypatch, capsys):
 
     pushed = []
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size, credentials):
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
+                   credentials, session_id=None):
         pushed.append(leaf)
         return _entry(leaf=leaf, original_name=local_path.name)
 
     monkeypatch.setattr(batch, "push_one_file", _fake_push)
     batch.cmd_push(_push_args(led))
 
-    assert pushed == ["P/videos-002"], "already-pushed file must be skipped"
+    assert pushed == ["P/videos"], "already-pushed file must be skipped"
     assert set(load_ledger(led)["entries"]) == {"videos/001.zip", "videos/002.zip"}
     assert "1 already pushed, 1 to go" in capsys.readouterr().out
 
@@ -439,7 +451,11 @@ def test_cmd_push_is_a_noop_when_everything_is_done(tmp_path, monkeypatch, capsy
 
 
 def test_cmd_push_writes_ledger_after_each_file(tmp_path, monkeypatch):
-    """A crash on file 2 must leave file 1 recorded, not lose the whole run."""
+    """File 1 is on disk before file 2 is attempted, so a kill never loses it.
+
+    Checked by reading the ledger from inside the second push: if the write
+    happened only at the end, file 1 would not be there yet.
+    """
     monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
     led = tmp_path / "led.json"
     monkeypatch.setattr(
@@ -448,20 +464,19 @@ def test_cmd_push_writes_ledger_after_each_file(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(batch, "_download_one", _stub_download)
 
-    calls = {"n": 0}
+    seen_mid_run = []
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size, credentials):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise RuntimeError("upload died on the second file")
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
+                   credentials, session_id=None):
+        seen_mid_run.append(set(load_ledger(led).get("entries", {})))
         return _entry(leaf=leaf, original_name=local_path.name)
 
     monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    batch.cmd_push(_push_args(led))
 
-    with pytest.raises(RuntimeError, match="second file"):
-        batch.cmd_push(_push_args(led))
-
-    assert set(load_ledger(led)["entries"]) == {"videos/001.zip"}
+    assert seen_mid_run[0] == set(), "nothing recorded before the first push"
+    assert seen_mid_run[1] == {"videos/001.zip"}, "file 1 must be durable by now"
+    assert set(load_ledger(led)["entries"]) == {"videos/001.zip", "videos/002.zip"}
 
 
 def test_cmd_push_bundles_small_files_into_one_leaf(tmp_path, monkeypatch):
@@ -475,18 +490,187 @@ def test_cmd_push_bundles_small_files_into_one_leaf(tmp_path, monkeypatch):
 
     leaves = []
 
-    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size, credentials):
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
+                   credentials, session_id=None):
         leaves.append(leaf)
         return _entry(leaf=leaf, original_name=local_path.name)
 
     monkeypatch.setattr(batch, "push_one_file", _fake_push)
-    batch.cmd_push(_push_args(led, parent="VideoMME-v2"))
+    batch.cmd_push(_push_args(led, parent="Video-MME-v2"))
 
-    assert sorted(leaves) == ["VideoMME-v2/annotations", "VideoMME-v2/videos-001"]
+    assert sorted(leaves) == ["Video-MME-v2/annotations", "Video-MME-v2/videos"]
     entries = load_ledger(led)["entries"]
     assert sorted(entries["<bundle:annotations>"]["bundled_files"]) == [
         "eval.yaml", "test.parquet",
     ]
+
+
+def test_cmd_push_all_videos_share_one_leaf(tmp_path, monkeypatch):
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    monkeypatch.setattr(
+        batch, "_list_repo_files",
+        lambda repo_id, repo_type: [f"videos/{n:03d}.zip" for n in (1, 2, 3)],
+    )
+    monkeypatch.setattr(batch, "_download_one", _stub_download)
+
+    seen = []
+
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
+                   credentials, session_id=None):
+        seen.append((leaf, session_id))
+        return _entry(leaf=leaf, session_id=session_id)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    batch.cmd_push(_push_args(led, parent="Video-MME-v2"))
+
+    assert {leaf for leaf, _ in seen} == {"Video-MME-v2/videos"}
+    # Distinct session ids are the only thing keeping them apart in there.
+    session_ids = [sid for _, sid in seen]
+    assert len(set(session_ids)) == 3
+    assert all(sid for sid in session_ids)
+
+
+# ---------------------------------------------------------------------------
+# cmd_push failure handling
+# ---------------------------------------------------------------------------
+
+def test_cmd_push_skips_a_failed_file_and_keeps_going(tmp_path, monkeypatch, capsys):
+    """A dropped connection on one file must not end a 41-file run."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    monkeypatch.setattr(
+        batch, "_list_repo_files",
+        lambda repo_id, repo_type: [f"videos/{n:03d}.zip" for n in (1, 2, 3)],
+    )
+    monkeypatch.setattr(batch, "_download_one", _stub_download)
+    monkeypatch.setattr(batch.drive, "delete_session_files", lambda *a, **k: 0)
+
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
+                   credentials, session_id=None):
+        if local_path.name == "002.zip":
+            raise OSError("connection reset by peer")
+        return _entry(leaf=leaf, session_id=session_id)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+
+    with pytest.raises(SystemExit) as excinfo:
+        batch.cmd_push(_push_args(led))
+    assert excinfo.value.code == 1
+
+    ledger = load_ledger(led)
+    # The two good files are recorded; only the bad one is outstanding.
+    assert set(ledger["entries"]) == {"videos/001.zip", "videos/003.zip"}
+    assert set(ledger["failures"]) == {"videos/002.zip"}
+    assert "connection reset" in ledger["failures"]["videos/002.zip"]["error"]
+    assert ledger["failures"]["videos/002.zip"]["failed_at"].endswith("Z")
+    out = capsys.readouterr().out
+    assert "FAILED" in out
+    assert "1 target(s) failed" in out
+
+
+def test_cmd_push_cleans_up_orphan_chunks_after_a_failure(tmp_path, monkeypatch):
+    """Resuming mints a new session id, so a failure's chunks must be deleted."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    monkeypatch.setattr(
+        batch, "_list_repo_files", lambda repo_id, repo_type: ["videos/001.zip"]
+    )
+    monkeypatch.setattr(batch, "_download_one", _stub_download)
+
+    cleaned = []
+
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
+                   credentials, session_id=None):
+        raise ssl.SSLError("[SYS] unknown error")
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    monkeypatch.setattr(
+        batch.drive, "delete_session_files",
+        lambda leaf, session_id, creds=None: cleaned.append((leaf, session_id)) or 2,
+    )
+
+    with pytest.raises(SystemExit):
+        batch.cmd_push(_push_args(led))
+
+    assert len(cleaned) == 1
+    leaf, session_id = cleaned[0]
+    assert leaf == "P/videos"
+    # The id handed to cleanup is the one the push used, not a fresh one.
+    assert session_id == load_ledger(led)["failures"]["videos/001.zip"]["session_id"]
+
+
+def test_cmd_push_survives_a_cleanup_failure(tmp_path, monkeypatch, capsys):
+    """Failing to delete orphans is worth a warning, not a crash."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    monkeypatch.setattr(
+        batch, "_list_repo_files", lambda repo_id, repo_type: ["videos/001.zip"]
+    )
+    monkeypatch.setattr(batch, "_download_one", _stub_download)
+    monkeypatch.setattr(
+        batch, "push_one_file",
+        MagicMock(side_effect=OSError("upload died")),
+    )
+    monkeypatch.setattr(
+        batch.drive, "delete_session_files",
+        MagicMock(side_effect=RuntimeError("cleanup also died")),
+    )
+
+    with pytest.raises(SystemExit):
+        batch.cmd_push(_push_args(led))
+    assert "WARNING: could not clean up" in capsys.readouterr().out
+
+
+def test_cmd_push_retries_only_the_failed_file_on_rerun(tmp_path, monkeypatch):
+    """Second run picks up exactly what failed, and clears it once it lands."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    save_ledger(led, {
+        "entries": {"videos/001.zip": _entry()},
+        "failures": {"videos/002.zip": {
+            "leaf": "P/videos", "session_id": "old-sid",
+            "error": "OSError: connection reset", "failed_at": "2026-10-05T07:31:04Z",
+        }},
+    })
+    monkeypatch.setattr(
+        batch, "_list_repo_files",
+        lambda repo_id, repo_type: ["videos/001.zip", "videos/002.zip"],
+    )
+    monkeypatch.setattr(batch, "_download_one", _stub_download)
+
+    pushed = []
+
+    def _fake_push(local_path, leaf, passphrase, work_dir, chunk_size,
+                   credentials, session_id=None):
+        pushed.append(local_path.name)
+        return _entry(leaf=leaf, session_id=session_id)
+
+    monkeypatch.setattr(batch, "push_one_file", _fake_push)
+    batch.cmd_push(_push_args(led))
+
+    assert pushed == ["002.zip"]
+    ledger = load_ledger(led)
+    assert set(ledger["entries"]) == {"videos/001.zip", "videos/002.zip"}
+    # The stale failure record is gone now that the file is in.
+    assert ledger["failures"] == {}
+
+
+def test_cmd_push_does_not_swallow_keyboard_interrupt(tmp_path, monkeypatch):
+    """Ctrl-C must stop the run, not be treated as one more skippable file."""
+    monkeypatch.setenv("INNOUT_PASSPHRASE", "pw")
+    led = tmp_path / "led.json"
+    monkeypatch.setattr(
+        batch, "_list_repo_files",
+        lambda repo_id, repo_type: ["videos/001.zip", "videos/002.zip"],
+    )
+    monkeypatch.setattr(batch, "_download_one", _stub_download)
+    monkeypatch.setattr(
+        batch, "push_one_file", MagicMock(side_effect=KeyboardInterrupt)
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        batch.cmd_push(_push_args(led))
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +688,7 @@ def _seed_drive(monkeypatch, payload: bytes, passphrase: str, store: Path):
     src.unlink()
     enc.unlink()
 
-    def _fake_download(leaf, dest_dir, credentials=None):
+    def _fake_download(leaf, dest_dir, credentials=None, session_id=None):
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
         copied = [Path(shutil.copy(c, dest_dir / c.name)) for c in chunks]
