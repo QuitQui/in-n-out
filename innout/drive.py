@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import http.client
 import io
 import os
+import random
+import socket
+import ssl
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,11 +18,67 @@ if TYPE_CHECKING:
     from googleapiclient.discovery import Resource
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+#: Attempts per Drive call. googleapiclient's own `num_retries` only covers the
+#: request that *opens* a resumable upload — the PUTs carrying the bytes go
+#: through a bare `http.request`, so a connection dropped mid-chunk raises
+#: straight out. On a flaky link that kills a multi-hour transfer, hence this
+#: outer loop.
+_MAX_ATTEMPTS = 6
+_BACKOFF_BASE = 2.0
+_BACKOFF_CAP = 60.0
+#: Drive's default page size is 100. A folder holding every chunk of a large
+#: dataset has many more, and an unpaginated list silently returns a prefix —
+#: which would join into a truncated, undecryptable blob.
+_PAGE_SIZE = 1000
+_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 _TOKEN_PATH = Path.home() / ".innout_drive_token.json"
 # Default location of the OAuth client-secrets file. Resolved OUTSIDE the repo
 # so credentials never sit inside the (now public) project folder: an explicit
 # path wins, then $INNOUT_CREDENTIALS, then a dotfile in $HOME.
 _DEFAULT_CREDENTIALS_PATH = Path.home() / ".innout_credentials.json"
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for failures worth retrying rather than aborting a long transfer.
+
+    Covers the dropped-connection family (`ssl.SSLError: [SYS] unknown error`
+    is what a mobile link produces mid-upload) plus Drive's own rate-limit
+    and 5xx responses. An auth failure or a 404 is not transient and must
+    surface immediately.
+    """
+    if isinstance(exc, (ssl.SSLError, socket.timeout, http.client.HTTPException)):
+        return True
+    # ConnectionError, TimeoutError and socket.error are all OSError.
+    if isinstance(exc, OSError):
+        return True
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in _RETRYABLE_STATUS:
+        return True
+    # google.auth raises TransportError for network trouble under the hood.
+    return type(exc).__name__ == "TransportError"
+
+
+def _with_retry(operation, description: str):
+    """Run `operation()`, retrying transient failures with backoff and jitter.
+
+    Jitter matters when several chunks fail at once: without it they all
+    come back at the same instant and collide again.
+    """
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            return operation()
+        except Exception as exc:  # noqa: BLE001 - re-raised below when fatal
+            if attempt == _MAX_ATTEMPTS or not _is_transient(exc):
+                raise
+            delay = min(_BACKOFF_BASE ** attempt, _BACKOFF_CAP)
+            delay += random.uniform(0, delay / 2)
+            print(f"[innout] {description}: {type(exc).__name__}: {exc} — "
+                  f"retry {attempt}/{_MAX_ATTEMPTS - 1} in {delay:.1f}s")
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _resolve_credentials_path(credentials_file: str | None) -> str:
@@ -73,19 +134,145 @@ def _get_service(credentials_file: str | None = None) -> Resource:
     return build("drive", "v3", credentials=creds)
 
 
-def _get_or_create_folder(service, folder_name: str) -> str:
-    safe_name = folder_name.replace("'", "\\'")
+_FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def _escape_query_value(value: str) -> str:
+    """Escape a value for interpolation into a single-quoted Drive query.
+
+    A literal backslash or apostrophe in a folder name would otherwise
+    terminate the quoted string and corrupt the query.
+    """
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _split_folder_path(folder_name: str) -> list[str]:
+    """Split a slash-separated Drive folder path into its segments.
+
+    Collapses repeated and trailing slashes, so "a//b/" == "a/b". Rejects
+    "." and ".." segments, which mean nothing in Drive and would otherwise
+    become folders literally named "." or "..".
+    """
+    segments = [s for s in folder_name.split("/") if s]
+    if not segments:
+        raise ValueError(f"Invalid Drive folder path: {folder_name!r}")
+    for segment in segments:
+        if segment in (".", ".."):
+            raise ValueError(
+                f"Invalid Drive folder path {folder_name!r}: "
+                f"segment {segment!r} is not allowed"
+            )
+    return segments
+
+
+def _find_child_folder(service, name: str, parent_id: str) -> str | None:
+    """Return the ID of folder `name` directly inside `parent_id`, else None.
+
+    Scoping each lookup to its parent is what makes nested paths safe: a
+    folder called "videos-001" elsewhere in the Drive can never match.
+    """
     query = (
-        f"name='{safe_name}' and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
+        f"name='{_escape_query_value(name)}' and "
+        f"'{_escape_query_value(parent_id)}' in parents and "
+        f"mimeType='{_FOLDER_MIME}' and trashed=false"
     )
     results = service.files().list(q=query, fields="files(id, name)").execute()
     files = results.get("files", [])
-    if files:
-        return files[0]["id"]
-    meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
-    folder = service.files().create(body=meta, fields="id").execute()
-    return folder["id"]
+    return files[0]["id"] if files else None
+
+
+def _resolve_folder_path(service, folder_name: str) -> str | None:
+    """Resolve an existing slash-separated folder path to its ID, else None.
+
+    Read-only counterpart of _get_or_create_folder, so a pull against a
+    mistyped path fails loudly instead of silently creating empty folders.
+    """
+    parent_id = "root"
+    for segment in _split_folder_path(folder_name):
+        child_id = _find_child_folder(service, segment, parent_id)
+        if child_id is None:
+            return None
+        parent_id = child_id
+    return parent_id
+
+
+def _get_or_create_folder(service, folder_name: str) -> str:
+    """Resolve a slash-separated folder path, creating any missing levels.
+
+    "VideoMME-v2/videos-001" resolves to the `videos-001` folder nested
+    inside `VideoMME-v2`, creating either if absent, and returns the ID of
+    the leaf — the folder chunks are uploaded into. One push per leaf
+    folder: a pull joins *every* file it finds there, so two sessions
+    sharing a folder would decrypt to garbage.
+
+    Note: the OAuth scope is drive.file, so only folders this app created
+    are visible. A `VideoMME-v2` folder made by hand in the Drive UI is
+    invisible here and a same-named sibling gets created instead.
+    """
+    parent_id = "root"
+    for segment in _split_folder_path(folder_name):
+        child_id = _find_child_folder(service, segment, parent_id)
+        if child_id is not None:
+            parent_id = child_id
+            continue
+        meta = {
+            "name": segment,
+            "mimeType": _FOLDER_MIME,
+            "parents": [parent_id],
+        }
+        parent_id = service.files().create(body=meta, fields="id").execute()["id"]
+    return parent_id
+
+
+def _list_folder_files(
+    service, folder_id: str, extra_fields: str = ""
+) -> list[dict]:
+    """Every non-trashed file directly in `folder_id`, following all pages.
+
+    Unpaginated, Drive stops at 100 files and says nothing about the rest.
+
+    extra_fields names further per-file fields to request, e.g. "size" --
+    Drive omits anything not asked for.
+    """
+    query = f"'{_escape_query_value(folder_id)}' in parents and trashed=false"
+    fields = "id, name" + (f", {extra_fields}" if extra_fields else "")
+    items: list[dict] = []
+    page_token = None
+    while True:
+        response = _with_retry(
+            lambda token=page_token: service.files().list(
+                q=query, fields=f"nextPageToken, files({fields})",
+                orderBy="name", pageSize=_PAGE_SIZE, pageToken=token,
+            ).execute(),
+            f"listing folder {folder_id}",
+        )
+        items.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return items
+
+
+def session_prefix(session_id: str) -> str:
+    """Chunk-name prefix identifying one push, e.g. "<uuid>.part"."""
+    return f"{session_id}.part"
+
+
+def list_sessions(folder_name: str, credentials_file: str | None = None) -> list[str]:
+    """Session IDs whose chunks live in `folder_name`, sorted.
+
+    A folder may hold several pushes side by side; this is how `pull`
+    discovers which ones are there.
+    """
+    service = _get_service(credentials_file)
+    folder_id = _resolve_folder_path(service, folder_name)
+    if folder_id is None:
+        raise ValueError(f"Drive folder not found: {folder_name!r}")
+    sessions = {
+        item["name"].rsplit(".part", 1)[0]
+        for item in _list_folder_files(service, folder_id)
+        if ".part" in item["name"]
+    }
+    return sorted(sessions)
 
 
 def upload_to_drive(
@@ -93,30 +280,78 @@ def upload_to_drive(
     folder_name: str,
     credentials_file: str | None = None,
 ) -> str:
-    """Upload chunks to a Google Drive folder, returns the folder URL."""
+    """Upload chunks to a Google Drive folder, returns the folder URL.
+
+    folder_name may be a nested path ("Video-MME-v2/videos"); missing levels
+    are created. Chunk names carry their session ID, so several pushes may
+    share one folder and still be told apart on the way back out.
+
+    Each chunk is retried independently on transient network failures.
+    """
     from googleapiclient.http import MediaFileUpload
 
     service = _get_service(credentials_file)
     folder_id = _get_or_create_folder(service, folder_name)
 
     for chunk in tqdm(chunks, desc="Uploading to Drive"):
-        media = MediaFileUpload(
-            str(chunk), mimetype="application/octet-stream", resumable=True
-        )
-        meta = {"name": chunk.name, "parents": [folder_id]}
-        service.files().create(
-            body=meta, media_body=media, fields="id"
-        ).execute(num_retries=10)
+        def _upload(chunk=chunk):
+            # The media object tracks its own read position, so a retry needs
+            # a fresh one rather than a rewound half-consumed upload.
+            media = MediaFileUpload(
+                str(chunk), mimetype="application/octet-stream", resumable=True
+            )
+            meta = {"name": chunk.name, "parents": [folder_id]}
+            return service.files().create(
+                body=meta, media_body=media, fields="id"
+            ).execute(num_retries=10)
+
+        _with_retry(_upload, f"uploading {chunk.name}")
 
     return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+def delete_session_files(
+    folder_name: str,
+    session_id: str,
+    credentials_file: str | None = None,
+) -> int:
+    """Delete the chunks of one session, returning how many were removed.
+
+    A push that dies partway leaves chunks behind. Resuming mints a new
+    session ID, so without this those orphans sit in the shared folder
+    forever, burning quota and muddling `list_sessions`.
+    """
+    service = _get_service(credentials_file)
+    folder_id = _resolve_folder_path(service, folder_name)
+    if folder_id is None:
+        return 0
+
+    prefix = session_prefix(session_id)
+    removed = 0
+    for item in _list_folder_files(service, folder_id):
+        if not item["name"].startswith(prefix):
+            continue
+        _with_retry(
+            lambda fid=item["id"]: service.files().delete(fileId=fid).execute(),
+            f"deleting {item['name']}",
+        )
+        removed += 1
+    return removed
 
 
 def download_from_drive(
     folder_name: str,
     dest_dir: Path,
     credentials_file: str | None = None,
+    session_id: str | None = None,
 ) -> list[Path]:
-    """Download all chunk files from a Google Drive folder into dest_dir.
+    """Download a push's chunk files from a Drive folder into dest_dir.
+
+    folder_name may be a nested path ("Video-MME-v2/videos"). With
+    `session_id`, only that push's chunks are fetched, so one folder can
+    hold many pushes. Without it, every file in the folder is taken — which
+    is correct only when the folder holds a single push, so a folder with
+    several raises rather than joining them into garbage.
 
     Returns the downloaded paths sorted by name (preserves chunk order).
     """
@@ -124,22 +359,30 @@ def download_from_drive(
 
     service = _get_service(credentials_file)
 
-    safe_name = folder_name.replace("'", "\\'")
-    query = (
-        f"name='{safe_name}' and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    folders = results.get("files", [])
-    if not folders:
+    folder_id = _resolve_folder_path(service, folder_name)
+    if folder_id is None:
         raise ValueError(f"Drive folder not found: {folder_name!r}")
-    folder_id = folders[0]["id"]
 
-    query = f"'{folder_id}' in parents and trashed=false"
-    results = service.files().list(
-        q=query, fields="files(id, name)", orderBy="name"
-    ).execute()
-    items = results.get("files", [])
+    items = _list_folder_files(service, folder_id)
+
+    if session_id is not None:
+        prefix = session_prefix(session_id)
+        items = [item for item in items if item["name"].startswith(prefix)]
+        if not items:
+            raise ValueError(
+                f"No chunks for session {session_id!r} in {folder_name!r}"
+            )
+    else:
+        found = sorted({
+            item["name"].rsplit(".part", 1)[0]
+            for item in items if ".part" in item["name"]
+        })
+        if len(found) > 1:
+            raise ValueError(
+                f"Drive folder {folder_name!r} holds {len(found)} pushes; "
+                f"joining them all would decrypt to garbage. Pass a session "
+                f"id — found: {', '.join(found)}"
+            )
 
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -147,12 +390,97 @@ def download_from_drive(
 
     for item in tqdm(items, desc="Downloading from Drive"):
         dest_file = dest_dir / item["name"]
-        request = service.files().get_media(fileId=item["id"])
-        with open(dest_file, "wb") as fh:
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk(num_retries=10)
+
+        def _download(item=item, dest_file=dest_file):
+            # Restart the file from scratch on retry: a partially written
+            # file would otherwise be appended to and silently corrupt.
+            request = service.files().get_media(fileId=item["id"])
+            with open(dest_file, "wb") as fh:
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk(num_retries=10)
+
+        _with_retry(_download, f"downloading {item['name']}")
         downloaded.append(dest_file)
 
     return sorted(downloaded, key=lambda p: p.name)
+
+
+# --- part-at-a-time upload (streaming push) ---------------------------------
+#
+# upload_to_drive() builds a service and resolves the folder on every call,
+# which is fine for a handful of chunks but wasteful across 55 parts. These
+# let a long push hold one service open, see what is already uploaded, and
+# send one part at a time.
+
+
+def folder_url(folder_id: str) -> str:
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+def open_folder(
+    folder_name: str, credentials_file: str | None = None
+) -> tuple[Resource, str]:
+    """Authenticate once and return (service, folder_id), creating the
+    folder path if needed."""
+    service = _get_service(credentials_file)
+    return service, _get_or_create_folder(service, folder_name)
+
+
+def folder_contents(service, folder_id: str) -> dict[str, dict]:
+    """{name: {"id": str, "size": int}} for the files directly in folder_id.
+
+    This is what makes a resumed push safe: rather than trusting a local
+    ledger, the push asks Drive what actually arrived.
+    """
+    out: dict[str, dict] = {}
+    for item in _list_folder_files(service, folder_id, extra_fields="size"):
+        out[item["name"]] = {
+            "id": item["id"],
+            # Drive reports size as a string, and omits it for folders
+            "size": int(item.get("size") or 0),
+        }
+    return out
+
+
+def delete_file(service, file_id: str) -> None:
+    _with_retry(
+        lambda: service.files().delete(fileId=file_id).execute(),
+        f"deleting file {file_id}",
+    )
+
+
+def upload_one(
+    service,
+    folder_id: str,
+    path: Path,
+    name: str | None = None,
+    replace_id: str | None = None,
+) -> str:
+    """Upload one file into folder_id and return its Drive file ID.
+
+    replace_id names an existing file to delete once the new upload lands --
+    used when re-sending a part whose previous upload was truncated. The
+    delete happens after the upload so a failure never leaves the folder
+    with neither copy.
+    """
+    from googleapiclient.http import MediaFileUpload
+
+    path = Path(path)
+
+    def _upload():
+        # The media object tracks its own read position, so a retry needs a
+        # fresh one rather than a rewound half-consumed upload.
+        media = MediaFileUpload(
+            str(path), mimetype="application/octet-stream", resumable=True
+        )
+        meta = {"name": name or path.name, "parents": [folder_id]}
+        return service.files().create(
+            body=meta, media_body=media, fields="id"
+        ).execute()
+
+    created = _with_retry(_upload, f"uploading {name or path.name}")
+    if replace_id:
+        delete_file(service, replace_id)
+    return created["id"]

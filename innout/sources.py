@@ -59,6 +59,7 @@ def acquire(
     source: str,
     work_dir: Path,
     excludes: list[str] | None = None,
+    repo_type: str = "model",
 ) -> Path:
     """Download / copy / clone the source into work_dir and return the path
     to a single file (tar.gz for directories/repos, original file for URLs/local files).
@@ -68,8 +69,10 @@ def acquire(
       - 'url'    → https://... URL to download
       - 'local'  → path string; if it's a directory, tar.gz it first
       - 'github' → "owner/repo" or "owner/repo@branch"
-      - 'hf'     → "org/model-name" HuggingFace repo ID
+      - 'hf'     → "org/repo-name" HuggingFace repo ID
     work_dir: scratch directory to place intermediate files
+    repo_type: HuggingFace repo kind ('model' | 'dataset' | 'space'); only
+      used when source_type is 'hf'
 
     Returns: Path to a single file inside work_dir
     """
@@ -83,7 +86,7 @@ def acquire(
     elif source_type == "github":
         return _acquire_github(source, work_dir, excludes)
     elif source_type == "hf":
-        return _acquire_hf(source, work_dir, excludes)
+        return _acquire_hf(source, work_dir, excludes, repo_type)
     else:
         raise ValueError(
             f"Unknown source_type {source_type!r}. "
@@ -153,14 +156,77 @@ def _acquire_github(
 
 
 def _acquire_hf(
-    source: str, work_dir: Path, excludes: list[str] | None = None
+    source: str,
+    work_dir: Path,
+    excludes: list[str] | None = None,
+    repo_type: str = "model",
 ) -> Path:
-    """Download a HuggingFace repo snapshot and return a tar.gz archive."""
+    """Download a HuggingFace repo snapshot and return a tar.gz archive.
+
+    repo_type must match the repo's kind on the Hub — models and datasets
+    live in separate namespaces, so a dataset ID resolved as a model 404s.
+    """
     from huggingface_hub import snapshot_download  # type: ignore[import]
 
     repo_name = source.split("/")[-1]
     local_dir = work_dir / repo_name
 
-    snapshot_download(repo_id=source, local_dir=str(local_dir))
+    snapshot_download(repo_id=source, repo_type=repo_type, local_dir=str(local_dir))
 
     return _tar_gz_dir(local_dir, work_dir, excludes)
+
+
+def acquire_dir(
+    source_type: str,
+    source: str,
+    work_dir: Path,
+    repo_type: str = "model",
+) -> Path:
+    """Acquire a source as a *directory*, without archiving it.
+
+    acquire() returns a single file, which means directory sources get
+    tarred to disk first -- a second full-size copy. The streaming push
+    pipeline tars on the fly instead, so it needs the directory itself.
+
+    Re-running this is cheap: snapshot_download skips files already
+    present and an existing clone is left alone, so an interrupted
+    multi-hour push resumes without re-fetching.
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    if source_type == "hf":
+        from huggingface_hub import snapshot_download  # type: ignore[import]
+
+        local_dir = work_dir / source.split("/")[-1]
+        snapshot_download(
+            repo_id=source, repo_type=repo_type, local_dir=str(local_dir)
+        )
+        return local_dir
+
+    if source_type == "github":
+        repo_spec, branch = (
+            source.rsplit("@", 1) if "@" in source else (source, None)
+        )
+        _, repo = repo_spec.split("/", 1)
+        dest_dir = work_dir / repo
+        if not dest_dir.exists():
+            cmd = ["git", "clone", "--depth", "1"]
+            if branch:
+                cmd += ["--branch", branch]
+            cmd += [f"https://github.com/{repo_spec}.git", str(dest_dir)]
+            subprocess.run(cmd, check=True)
+        return dest_dir
+
+    if source_type == "local":
+        path = Path(source).expanduser()
+        if not path.is_dir():
+            raise ValueError(
+                f"streaming push needs a directory, but {source!r} is not one"
+            )
+        return path
+
+    raise ValueError(
+        f"source_type {source_type!r} has no directory form; "
+        "streaming push supports 'hf', 'github', and 'local' directories"
+    )
