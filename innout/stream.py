@@ -161,6 +161,7 @@ def encrypt_to_parts(
     nonce: bytes | None = None,
     on_part: Callable[[PartInfo], None] | None = None,
     skip_before: int = 0,
+    skip_indices: set[int] | None = None,
     delete_after: bool = True,
     block_size: int = BLOCK_SIZE,
 ) -> StreamResult:
@@ -170,12 +171,16 @@ def encrypt_to_parts(
     deleted unless delete_after is False, so disk holds one part at a
     time.
 
-    skip_before supports resume: parts below that index are hashed but
-    never written to disk. The cipher stream has to run through them
+    skip_before and skip_indices support resume: those parts are hashed
+    but never written to disk. The cipher stream has to run through them
     anyway -- AES-GCM is one continuous stream over the whole archive, so
     byte N depends on every byte before it -- but there is no need to
     spend the disk or the upload. Pass the original salt and nonce so the
     regenerated stream matches what was already uploaded.
+
+    skip_indices takes an arbitrary set rather than a prefix because an
+    interrupted push leaves holes, not a clean cut: if part 7 failed while
+    8-20 landed, only 7 needs re-sending.
 
     Returns a StreamResult whose parts carry the sha256 of every part,
     including skipped ones, so a resumed run still produces a complete
@@ -187,8 +192,12 @@ def encrypt_to_parts(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    skipped = set(skip_indices or ())
     enc = crypto.StreamEncryptor(passphrase, salt=salt, nonce=nonce)
     result = StreamResult(salt=enc.salt, nonce=enc.nonce)
+
+    def _wanted(i: int) -> bool:
+        return i >= skip_before and i not in skipped
 
     index = 0
     handle = None
@@ -199,7 +208,7 @@ def encrypt_to_parts(
         nonlocal handle, digest, written
         digest = hashlib.sha256()
         written = 0
-        handle = None if index < skip_before else open(out_dir / part_name(prefix, index), "wb")
+        handle = open(out_dir / part_name(prefix, index), "wb") if _wanted(index) else None
 
     def _close() -> None:
         nonlocal index, handle
@@ -207,7 +216,7 @@ def encrypt_to_parts(
             handle.close()
             handle = None
         name = part_name(prefix, index)
-        path = None if index < skip_before else out_dir / name
+        path = out_dir / name if _wanted(index) else None
         info = PartInfo(index=index, name=name, size=written, sha256=digest.hexdigest(), path=path)
         result.parts.append(info)
         if on_part is not None:
@@ -309,3 +318,133 @@ def save_state(path: Path, state: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
     os.replace(tmp, path)
+
+
+# --- pull side --------------------------------------------------------------
+
+
+def find_parts(from_dir: Path, prefix: str | None = None) -> list[Path]:
+    """The part files in from_dir, in join order.
+
+    Names sort lexically into numeric order because the index is
+    zero-padded. A directory holding two different pushes is refused
+    rather than joined: concatenating parts from two cipher streams
+    decrypts to nothing, and the error says so before the operator spends
+    hours on it.
+    """
+    from_dir = Path(from_dir)
+    pattern = f"{prefix}.part???" if prefix else "*.part???"
+    parts = sorted(from_dir.glob(pattern))
+    if not parts:
+        raise ValueError(f"no part files (*.part???) found in {from_dir}")
+
+    prefixes = {p.name.rsplit(".part", 1)[0] for p in parts}
+    if len(prefixes) > 1:
+        raise ValueError(
+            f"{from_dir} holds {len(prefixes)} different pushes "
+            f"({', '.join(sorted(prefixes))}); joining them would decrypt to "
+            "garbage. Pass --part-prefix to pick one"
+        )
+
+    indices = [int(p.name.rsplit(".part", 1)[1]) for p in parts]
+    missing = sorted(set(range(indices[-1] + 1)) - set(indices))
+    if missing:
+        raise ValueError(
+            f"part(s) {missing} are missing from {from_dir}. The archive is "
+            "one continuous cipher stream, so every part has to be present"
+        )
+    return parts
+
+
+def verify_parts(parts: list[Path], manifest: dict[str, str]) -> None:
+    """Check every part against the manifest before decrypting anything.
+
+    Worth the extra read: GCM only authenticates at the end of the stream,
+    so without this a single corrupt part is only discovered after writing
+    the entire output.
+    """
+    unknown = [p.name for p in parts if p.name not in manifest]
+    if unknown:
+        raise ValueError(f"manifest has no entry for: {', '.join(unknown)}")
+    bad = [p.name for p in parts if sha256_file(p) != manifest[p.name]]
+    if bad:
+        raise ValueError(
+            f"sha256 mismatch on {', '.join(bad)} -- re-download these parts"
+        )
+    absent = sorted(set(manifest) - {p.name for p in parts})
+    if absent:
+        raise ValueError(f"manifest lists part(s) not present: {', '.join(absent)}")
+
+
+def iter_plaintext(
+    parts: list[Path],
+    passphrase: str,
+    *,
+    delete_consumed: bool = False,
+    on_part: Callable[[Path], None] | None = None,
+    block_size: int = BLOCK_SIZE,
+) -> Iterator[bytes]:
+    """Decrypt parts in order, yielding plaintext blocks.
+
+    With delete_consumed each part is removed once it has been fed
+    through, which halves what a restore needs: otherwise the parts and
+    the restored tree sit side by side -- 105 GB + 105 GB for
+    Video-MME-v2.
+    """
+    dec = crypto.StreamDecryptor(passphrase)
+    for path in parts:
+        with open(path, "rb") as handle:
+            while True:
+                block = handle.read(block_size)
+                if not block:
+                    break
+                out = dec.update(block)
+                if out:
+                    yield out
+        if on_part is not None:
+            on_part(path)
+        if delete_consumed:
+            path.unlink(missing_ok=True)
+    yield dec.finalize()
+
+
+@contextmanager
+def plaintext_stream(
+    parts: list[Path],
+    passphrase: str,
+    *,
+    delete_consumed: bool = False,
+    on_part: Callable[[Path], None] | None = None,
+) -> Iterator[BinaryIO]:
+    """Yield a readable stream of the decrypted plaintext.
+
+    Mirror image of tar_stream: a thread pushes decrypted blocks into a
+    pipe so tarfile can pull them, letting a restore untar on the fly
+    instead of materialising a 105 GB tar first.
+    """
+    read_fd, write_fd = os.pipe()
+    error: list[BaseException] = []
+
+    def _feed() -> None:
+        try:
+            with open(write_fd, "wb", closefd=True) as writer:
+                for block in iter_plaintext(
+                    parts, passphrase,
+                    delete_consumed=delete_consumed, on_part=on_part,
+                ):
+                    writer.write(block)
+        except BaseException as exc:  # includes BrokenPipeError on early close
+            error.append(exc)
+
+    thread = threading.Thread(target=_feed, name="innout-decrypt", daemon=True)
+    thread.start()
+    reader = open(read_fd, "rb", closefd=True)
+    try:
+        yield reader
+    finally:
+        # Close first: a consumer that bailed out leaves the feeder blocked
+        # on a full pipe, and closing the read end unblocks it with EPIPE.
+        reader.close()
+        thread.join()
+    if error:
+        raise error[0]

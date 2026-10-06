@@ -389,7 +389,12 @@ def test_pull_from_dir_round_trip():
 
 
 def test_pull_from_dir_empty_raises():
-    """--from-dir with no chunk files should raise SystemExit."""
+    """--from-dir with no part files should raise SystemExit.
+
+    Wording note: these were "chunks" in the server era, but the files are
+    literally named *.part???, so the message names what the operator sees
+    in their folder.
+    """
     import argparse
     from innout.cli import cmd_pull
 
@@ -406,7 +411,7 @@ def test_pull_from_dir_empty_raises():
             api_key=None,
             output=str(tmp / "out"),
         )
-        with pytest.raises(SystemExit, match="no chunk files"):
+        with pytest.raises(SystemExit, match="no part files"):
             cmd_pull(args)
     finally:
         shutil.rmtree(tmp)

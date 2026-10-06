@@ -224,18 +224,24 @@ def _get_or_create_folder(service, folder_name: str) -> str:
     return parent_id
 
 
-def _list_folder_files(service, folder_id: str) -> list[dict]:
+def _list_folder_files(
+    service, folder_id: str, extra_fields: str = ""
+) -> list[dict]:
     """Every non-trashed file directly in `folder_id`, following all pages.
 
     Unpaginated, Drive stops at 100 files and says nothing about the rest.
+
+    extra_fields names further per-file fields to request, e.g. "size" --
+    Drive omits anything not asked for.
     """
     query = f"'{_escape_query_value(folder_id)}' in parents and trashed=false"
+    fields = "id, name" + (f", {extra_fields}" if extra_fields else "")
     items: list[dict] = []
     page_token = None
     while True:
         response = _with_retry(
             lambda token=page_token: service.files().list(
-                q=query, fields="nextPageToken, files(id, name)",
+                q=query, fields=f"nextPageToken, files({fields})",
                 orderBy="name", pageSize=_PAGE_SIZE, pageToken=token,
             ).execute(),
             f"listing folder {folder_id}",
@@ -399,3 +405,82 @@ def download_from_drive(
         downloaded.append(dest_file)
 
     return sorted(downloaded, key=lambda p: p.name)
+
+
+# --- part-at-a-time upload (streaming push) ---------------------------------
+#
+# upload_to_drive() builds a service and resolves the folder on every call,
+# which is fine for a handful of chunks but wasteful across 55 parts. These
+# let a long push hold one service open, see what is already uploaded, and
+# send one part at a time.
+
+
+def folder_url(folder_id: str) -> str:
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+def open_folder(
+    folder_name: str, credentials_file: str | None = None
+) -> tuple[Resource, str]:
+    """Authenticate once and return (service, folder_id), creating the
+    folder path if needed."""
+    service = _get_service(credentials_file)
+    return service, _get_or_create_folder(service, folder_name)
+
+
+def folder_contents(service, folder_id: str) -> dict[str, dict]:
+    """{name: {"id": str, "size": int}} for the files directly in folder_id.
+
+    This is what makes a resumed push safe: rather than trusting a local
+    ledger, the push asks Drive what actually arrived.
+    """
+    out: dict[str, dict] = {}
+    for item in _list_folder_files(service, folder_id, extra_fields="size"):
+        out[item["name"]] = {
+            "id": item["id"],
+            # Drive reports size as a string, and omits it for folders
+            "size": int(item.get("size") or 0),
+        }
+    return out
+
+
+def delete_file(service, file_id: str) -> None:
+    _with_retry(
+        lambda: service.files().delete(fileId=file_id).execute(),
+        f"deleting file {file_id}",
+    )
+
+
+def upload_one(
+    service,
+    folder_id: str,
+    path: Path,
+    name: str | None = None,
+    replace_id: str | None = None,
+) -> str:
+    """Upload one file into folder_id and return its Drive file ID.
+
+    replace_id names an existing file to delete once the new upload lands --
+    used when re-sending a part whose previous upload was truncated. The
+    delete happens after the upload so a failure never leaves the folder
+    with neither copy.
+    """
+    from googleapiclient.http import MediaFileUpload
+
+    path = Path(path)
+
+    def _upload():
+        # The media object tracks its own read position, so a retry needs a
+        # fresh one rather than a rewound half-consumed upload.
+        media = MediaFileUpload(
+            str(path), mimetype="application/octet-stream", resumable=True
+        )
+        meta = {"name": name or path.name, "parents": [folder_id]}
+        return service.files().create(
+            body=meta, media_body=media, fields="id"
+        ).execute()
+
+    created = _with_retry(_upload, f"uploading {name or path.name}")
+    if replace_id:
+        delete_file(service, replace_id)
+    return created["id"]

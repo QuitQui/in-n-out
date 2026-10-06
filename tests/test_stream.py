@@ -370,3 +370,171 @@ def test_save_state_leaves_no_temp_file(tmp_path):
     path = tmp_path / "state.json"
     stream.save_state(path, {"a": 1})
     assert sorted(f.name for f in tmp_path.iterdir()) == ["state.json"]
+
+
+# --- pull side: finding and verifying parts ---------------------------------
+
+
+def write_parts(dirpath, names):
+    dirpath.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (dirpath / name).write_bytes(b"x")
+    return dirpath
+
+
+def test_find_parts_sorts_numerically(tmp_path):
+    d = write_parts(tmp_path / "p", ["a.part002", "a.part000", "a.part001"])
+    assert [p.name for p in stream.find_parts(d)] == [
+        "a.part000", "a.part001", "a.part002",
+    ]
+
+
+def test_find_parts_refuses_an_empty_directory(tmp_path):
+    (tmp_path / "p").mkdir()
+    with pytest.raises(ValueError, match="no part files"):
+        stream.find_parts(tmp_path / "p")
+
+
+def test_find_parts_refuses_two_pushes_in_one_directory(tmp_path):
+    """Concatenating parts from two cipher streams decrypts to nothing, so
+    say so before the operator spends hours on it."""
+    d = write_parts(tmp_path / "p", ["a.part000", "b.part000"])
+    with pytest.raises(ValueError, match="2 different pushes"):
+        stream.find_parts(d)
+
+
+def test_find_parts_picks_one_push_by_prefix(tmp_path):
+    d = write_parts(tmp_path / "p", ["a.part000", "a.part001", "b.part000"])
+    assert [p.name for p in stream.find_parts(d, "a")] == ["a.part000", "a.part001"]
+
+
+def test_find_parts_reports_a_missing_part_by_number(tmp_path):
+    """A gap is the one failure mode a 55-part manual download invites."""
+    d = write_parts(tmp_path / "p", ["a.part000", "a.part002", "a.part003"])
+    with pytest.raises(ValueError, match=r"part\(s\) \[1\] are missing"):
+        stream.find_parts(d)
+
+
+def test_verify_parts_accepts_matching_digests(tmp_path):
+    out = tmp_path / "parts"
+    result = stream.encrypt_to_parts(
+        io.BytesIO(os.urandom(9000)), "pw", out, "p", 2048, delete_after=False
+    )
+    manifest = {p.name: p.sha256 for p in result.parts}
+    stream.verify_parts(stream.find_parts(out), manifest)
+
+
+def test_verify_parts_names_the_corrupt_part(tmp_path):
+    out = tmp_path / "parts"
+    result = stream.encrypt_to_parts(
+        io.BytesIO(os.urandom(9000)), "pw", out, "p", 2048, delete_after=False
+    )
+    manifest = {p.name: p.sha256 for p in result.parts}
+    victim = out / "p.part001"
+    victim.write_bytes(victim.read_bytes()[:-5] + b"BROKE")
+
+    with pytest.raises(ValueError, match="sha256 mismatch on p.part001"):
+        stream.verify_parts(stream.find_parts(out), manifest)
+
+
+def test_verify_parts_flags_a_part_absent_from_the_manifest(tmp_path):
+    d = write_parts(tmp_path / "p", ["a.part000"])
+    with pytest.raises(ValueError, match="no entry for: a.part000"):
+        stream.verify_parts(stream.find_parts(d), {})
+
+
+def test_verify_parts_flags_a_manifest_entry_with_no_file(tmp_path):
+    out = tmp_path / "parts"
+    result = stream.encrypt_to_parts(
+        io.BytesIO(os.urandom(5000)), "pw", out, "p", 2048, delete_after=False
+    )
+    manifest = {p.name: p.sha256 for p in result.parts}
+    manifest["p.part099"] = "f" * 64
+    with pytest.raises(ValueError, match="not present: p.part099"):
+        stream.verify_parts(stream.find_parts(out), manifest)
+
+
+# --- pull side: streaming decrypt -------------------------------------------
+
+
+def test_iter_plaintext_restores_the_payload(tmp_path):
+    payload = os.urandom(30_000)
+    out = tmp_path / "parts"
+    stream.encrypt_to_parts(
+        io.BytesIO(payload), "pw", out, "p", 4096, delete_after=False
+    )
+    joined = b"".join(stream.iter_plaintext(stream.find_parts(out), "pw"))
+    assert joined == payload
+
+
+def test_iter_plaintext_rejects_a_wrong_passphrase(tmp_path):
+    out = tmp_path / "parts"
+    stream.encrypt_to_parts(
+        io.BytesIO(os.urandom(5000)), "pw", out, "p", 2048, delete_after=False
+    )
+    with pytest.raises(ValueError, match="wrong passphrase or corrupted"):
+        list(stream.iter_plaintext(stream.find_parts(out), "nope"))
+
+
+def test_delete_consumed_frees_each_part_as_it_is_read(tmp_path):
+    """Without this a restore needs the parts and the result side by side --
+    105 GB + 105 GB for Video-MME-v2."""
+    payload = os.urandom(20_000)
+    out = tmp_path / "parts"
+    stream.encrypt_to_parts(
+        io.BytesIO(payload), "pw", out, "p", 4096, delete_after=False
+    )
+    parts = stream.find_parts(out)
+    remaining = []
+
+    def on_part(_path):
+        remaining.append(len(list(out.glob("*.part???"))))
+
+    joined = b"".join(
+        stream.iter_plaintext(parts, "pw", delete_consumed=True, on_part=on_part)
+    )
+    assert joined == payload
+    # on_part fires before the delete, so counts walk down from len(parts)
+    assert remaining == list(range(len(parts), 0, -1)), remaining
+    assert list(out.glob("*.part???")) == []
+
+
+def test_plaintext_stream_feeds_tarfile_directly(tmp_path):
+    """The restore path: parts in, extracted tree out, no 105 GB tar in
+    between."""
+    src = tmp_path / "Video-MME-v2"
+    files = make_tree(src, junk=False)
+    out = tmp_path / "parts"
+    with stream.tar_stream(src) as reader:
+        stream.encrypt_to_parts(
+            reader, "pw", out, "Video-MME-v2", 4096, delete_after=False
+        )
+
+    dest = tmp_path / "restored"
+    with stream.plaintext_stream(stream.find_parts(out), "pw") as reader:
+        with tarfile.open(fileobj=reader, mode="r|*") as tar:
+            tar.extractall(dest, filter="data")
+
+    for name, blob in files.items():
+        assert (dest / "Video-MME-v2" / name).read_bytes() == blob
+
+
+def test_plaintext_stream_does_not_hang_when_the_consumer_bails_out(tmp_path):
+    out = tmp_path / "parts"
+    stream.encrypt_to_parts(
+        io.BytesIO(os.urandom(200_000)), "pw", out, "p", 4096, delete_after=False
+    )
+    with pytest.raises(RuntimeError):
+        with stream.plaintext_stream(stream.find_parts(out), "pw") as reader:
+            reader.read(16)
+            raise RuntimeError("consumer gave up")
+
+
+def test_plaintext_stream_propagates_a_bad_passphrase(tmp_path):
+    out = tmp_path / "parts"
+    stream.encrypt_to_parts(
+        io.BytesIO(os.urandom(5000)), "pw", out, "p", 2048, delete_after=False
+    )
+    with pytest.raises(ValueError, match="wrong passphrase or corrupted"):
+        with stream.plaintext_stream(stream.find_parts(out), "nope") as reader:
+            reader.read()

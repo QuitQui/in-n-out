@@ -174,3 +174,59 @@ def _acquire_hf(
     snapshot_download(repo_id=source, repo_type=repo_type, local_dir=str(local_dir))
 
     return _tar_gz_dir(local_dir, work_dir, excludes)
+
+
+def acquire_dir(
+    source_type: str,
+    source: str,
+    work_dir: Path,
+    repo_type: str = "model",
+) -> Path:
+    """Acquire a source as a *directory*, without archiving it.
+
+    acquire() returns a single file, which means directory sources get
+    tarred to disk first -- a second full-size copy. The streaming push
+    pipeline tars on the fly instead, so it needs the directory itself.
+
+    Re-running this is cheap: snapshot_download skips files already
+    present and an existing clone is left alone, so an interrupted
+    multi-hour push resumes without re-fetching.
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    if source_type == "hf":
+        from huggingface_hub import snapshot_download  # type: ignore[import]
+
+        local_dir = work_dir / source.split("/")[-1]
+        snapshot_download(
+            repo_id=source, repo_type=repo_type, local_dir=str(local_dir)
+        )
+        return local_dir
+
+    if source_type == "github":
+        repo_spec, branch = (
+            source.rsplit("@", 1) if "@" in source else (source, None)
+        )
+        _, repo = repo_spec.split("/", 1)
+        dest_dir = work_dir / repo
+        if not dest_dir.exists():
+            cmd = ["git", "clone", "--depth", "1"]
+            if branch:
+                cmd += ["--branch", branch]
+            cmd += [f"https://github.com/{repo_spec}.git", str(dest_dir)]
+            subprocess.run(cmd, check=True)
+        return dest_dir
+
+    if source_type == "local":
+        path = Path(source).expanduser()
+        if not path.is_dir():
+            raise ValueError(
+                f"streaming push needs a directory, but {source!r} is not one"
+            )
+        return path
+
+    raise ValueError(
+        f"source_type {source_type!r} has no directory form; "
+        "streaming push supports 'hf', 'github', and 'local' directories"
+    )
