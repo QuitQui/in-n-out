@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tarfile
 import threading
 from contextlib import contextmanager
@@ -62,14 +63,26 @@ def parse_size(text: str) -> int:
     return int(value * unit)
 
 
-def part_name(prefix: str, index: int) -> str:
-    """Name of part `index`, matching the *.part??? glob the pull side uses."""
+def part_name(prefix: str, index: int, suffix: str = "") -> str:
+    """Name of part `index`, e.g. "Video-MME-v2.part007" or, with a
+    camouflage suffix, "Video-MME-v2.part007.pdf".
+
+    The suffix is cosmetic only -- it changes how the file looks in a
+    listing, not what it is. The bytes are AES-256-GCM either way, and
+    the pull side recovers the suffix from the names it finds.
+    """
     if index >= MAX_PARTS:
         raise ValueError(
             f"part index {index} exceeds the {MAX_PARTS}-part limit; "
             "use a larger --part-size"
         )
-    return f"{prefix}.part{index:03d}"
+    return f"{prefix}.part{index:03d}{suffix}"
+
+
+# Splits "Video-MME-v2.part007.pdf" into prefix, index, suffix. Greedy on
+# the prefix so a name that happens to contain ".partNNN" earlier still
+# anchors on the last one.
+PART_RE = re.compile(r"^(?P<prefix>.+)\.part(?P<index>\d{3})(?P<suffix>.*)$")
 
 
 @contextmanager
@@ -160,6 +173,7 @@ def encrypt_to_parts(
     salt: bytes | None = None,
     nonce: bytes | None = None,
     on_part: Callable[[PartInfo], None] | None = None,
+    suffix: str = "",
     skip_before: int = 0,
     skip_indices: set[int] | None = None,
     delete_after: bool = True,
@@ -208,14 +222,17 @@ def encrypt_to_parts(
         nonlocal handle, digest, written
         digest = hashlib.sha256()
         written = 0
-        handle = open(out_dir / part_name(prefix, index), "wb") if _wanted(index) else None
+        handle = (
+            open(out_dir / part_name(prefix, index, suffix), "wb")
+            if _wanted(index) else None
+        )
 
     def _close() -> None:
         nonlocal index, handle
         if handle is not None:
             handle.close()
             handle = None
-        name = part_name(prefix, index)
+        name = part_name(prefix, index, suffix)
         path = out_dir / name if _wanted(index) else None
         info = PartInfo(index=index, name=name, size=written, sha256=digest.hexdigest(), path=path)
         result.parts.append(info)
@@ -253,7 +270,7 @@ def encrypt_to_parts(
         _close()
     elif handle is not None:  # an exactly-full final part left an empty file open
         handle.close()
-        (out_dir / part_name(prefix, index)).unlink(missing_ok=True)
+        (out_dir / part_name(prefix, index, suffix)).unlink(missing_ok=True)
 
     return result
 
@@ -323,37 +340,60 @@ def save_state(path: Path, state: dict) -> None:
 # --- pull side --------------------------------------------------------------
 
 
-def find_parts(from_dir: Path, prefix: str | None = None) -> list[Path]:
+def find_parts(
+    from_dir: Path,
+    prefix: str | None = None,
+    suffix: str | None = None,
+) -> list[Path]:
     """The part files in from_dir, in join order.
 
-    Names sort lexically into numeric order because the index is
-    zero-padded. A directory holding two different pushes is refused
-    rather than joined: concatenating parts from two cipher streams
-    decrypts to nothing, and the error says so before the operator spends
-    hours on it.
+    Both the prefix and any camouflage suffix are recovered from the
+    names, so a folder of ``Video-MME-v2.part000.pdf`` restores with no
+    extra flags -- the operator should not have to remember what the push
+    was disguised as. Pass prefix or suffix to disambiguate a directory
+    holding more than one push.
+
+    A directory holding two different pushes is refused rather than
+    joined: concatenating parts from two cipher streams decrypts to
+    nothing, and saying so now beats finding out after 105 GB.
     """
     from_dir = Path(from_dir)
-    pattern = f"{prefix}.part???" if prefix else "*.part???"
-    parts = sorted(from_dir.glob(pattern))
-    if not parts:
-        raise ValueError(f"no part files (*.part???) found in {from_dir}")
+    found: dict[tuple[str, str], dict[int, Path]] = {}
+    for path in from_dir.iterdir():
+        if not path.is_file():
+            continue
+        match = PART_RE.match(path.name)
+        if not match:
+            continue
+        key = (match["prefix"], match["suffix"])
+        if prefix is not None and key[0] != prefix:
+            continue
+        if suffix is not None and key[1] != suffix:
+            continue
+        found.setdefault(key, {})[int(match["index"])] = path
 
-    prefixes = {p.name.rsplit(".part", 1)[0] for p in parts}
-    if len(prefixes) > 1:
+    if not found:
+        wanted = "*.part???" + (suffix if suffix else "")
+        raise ValueError(f"no part files ({wanted}) found in {from_dir}")
+
+    if len(found) > 1:
+        shown = ", ".join(
+            f"{p}.partNNN{s}" for p, s in sorted(found)
+        )
         raise ValueError(
-            f"{from_dir} holds {len(prefixes)} different pushes "
-            f"({', '.join(sorted(prefixes))}); joining them would decrypt to "
-            "garbage. Pass --part-prefix to pick one"
+            f"{from_dir} holds {len(found)} different pushes ({shown}); "
+            "joining them would decrypt to garbage. Pass --part-prefix or "
+            "--part-suffix to pick one"
         )
 
-    indices = [int(p.name.rsplit(".part", 1)[1]) for p in parts]
-    missing = sorted(set(range(indices[-1] + 1)) - set(indices))
+    (_, _), by_index = next(iter(found.items()))
+    missing = sorted(set(range(max(by_index) + 1)) - set(by_index))
     if missing:
         raise ValueError(
             f"part(s) {missing} are missing from {from_dir}. The archive is "
             "one continuous cipher stream, so every part has to be present"
         )
-    return parts
+    return [by_index[i] for i in sorted(by_index)]
 
 
 def verify_parts(parts: list[Path], manifest: dict[str, str]) -> None:

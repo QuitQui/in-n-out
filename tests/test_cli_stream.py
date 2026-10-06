@@ -62,6 +62,20 @@ class FakeDrive:
             module, "folder_url", lambda fid: f"fake://{fid}", raising=False
         )
         monkeypatch.setattr(module, "delete_file", lambda s, i: None, raising=False)
+        # Belt and braces: any route that reaches a real Drive call is a bug
+        # in the test, not something to discover by finding junk in the
+        # operator's Drive. This has already happened once.
+        for name in ("upload_to_drive", "download_from_drive", "_get_service"):
+            monkeypatch.setattr(module, name, self._forbidden(name), raising=False)
+
+    @staticmethod
+    def _forbidden(name):
+        def _blow_up(*_args, **_kwargs):
+            raise AssertionError(
+                f"test reached the real Drive API via {name}(); "
+                "the fake does not cover this code path"
+            )
+        return _blow_up
 
     def _open(self, folder_name, credentials_file=None):
         return object(), folder_name
@@ -269,12 +283,123 @@ def test_streaming_push_requires_a_destination(tmp_path):
              "--passphrase", "pw"])
 
 
-def test_streaming_push_refuses_a_file_source(tmp_path, fake_drive):
-    """The pipeline tars a directory on the fly; a single file has no tree."""
+def test_a_directory_to_drive_streams_without_asking(tmp_path, fake_drive):
+    """--part-size only picks the size; streaming is the default for a tree.
+
+    Proven by the fake: it only implements the streaming calls, so a push
+    that landed on the legacy path would hit the forbidden-API guard.
+    """
+    src = tmp_path / "Video-MME-v2"
+    make_dataset(src)
+    run(["push", "--local", str(src), "--drive", "VideoMMEv2",
+         "--passphrase", "pw", "--exclude", ".cache",
+         "--work-dir", str(tmp_path / "work")])
+
+    parts = sorted(p.name for p in fake_drive.root.glob("*.part???"))
+    assert parts and parts[0] == "Video-MME-v2.part000"
+    assert (fake_drive.root / "MANIFEST.sha256").exists()
+
+
+def test_default_part_size_is_the_agreed_1_8_gib():
+    """The operator's hard limit: under 2 GB, with margin."""
+    args = cli.build_parser().parse_args(
+        ["push", "--local", ".", "--drive", "D"]
+    )
+    assert stream.parse_size(args.part_size) == stream.parse_size("1.8GiB")
+    assert stream.parse_size(args.part_size) < 2_000_000_000
+
+
+@pytest.mark.parametrize(
+    "source_type,is_dir",
+    [("hf", True), ("github", True), ("url", False)],
+)
+def test_routing_treats_repos_as_trees_and_urls_as_files(source_type, is_dir):
+    assert cli._is_directory_source(source_type, "owner/repo") is is_dir
+
+
+def test_routing_sends_a_single_file_down_the_legacy_path(tmp_path):
+    """The streaming pipeline tars a directory on the fly; one file has no
+    tree to walk, so it must not be routed there."""
     blob = tmp_path / "one.bin"
     blob.write_bytes(b"x" * 100)
-    with pytest.raises(ValueError, match="is not one"):
-        run(push_argv(blob, work=tmp_path / "work"))
+    assert cli._is_directory_source("local", str(blob)) is False
+    assert cli._is_directory_source("local", str(tmp_path)) is True
+
+
+# --- camouflage suffix ------------------------------------------------------
+
+
+def test_suffix_renames_every_uploaded_file_including_the_manifest(
+    tmp_path, fake_drive
+):
+    """A bare MANIFEST.sha256 beside 55 .pdf files gives the game away."""
+    src = tmp_path / "Video-MME-v2"
+    make_dataset(src)
+    run(push_argv(src, work=tmp_path / "work",
+                  extra=("--part-suffix", ".pdf")))
+
+    names = sorted(p.name for p in fake_drive.root.iterdir())
+    assert all(n.endswith(".pdf") for n in names), names
+    assert "Video-MME-v2.part000.pdf" in names
+    assert "MANIFEST.sha256.pdf" in names
+
+
+def test_suffixed_parts_are_not_actually_pdfs(tmp_path, fake_drive):
+    """The suffix is cosmetic. Pin that down so nobody later mistakes it
+    for a format conversion or a second layer of protection."""
+    src = tmp_path / "Video-MME-v2"
+    make_dataset(src)
+    run(push_argv(src, work=tmp_path / "work",
+                  extra=("--part-suffix", ".pdf")))
+
+    first = fake_drive.root / "Video-MME-v2.part000.pdf"
+    head = first.read_bytes()[:5]
+    assert head != b"%PDF-", "a real PDF header would be a lie about the bytes"
+
+
+def test_pull_recovers_the_suffix_without_being_told(tmp_path, fake_drive):
+    """The operator downloads 55 .pdf files months later; they should not
+    have to remember what the push was disguised as."""
+    src = tmp_path / "Video-MME-v2"
+    files = make_dataset(src)
+    run(push_argv(src, work=tmp_path / "work",
+                  extra=("--part-suffix", ".pdf")))
+    downloaded = download_all(fake_drive, tmp_path / "downloaded")
+
+    # no --part-suffix here on purpose
+    run(["pull", "--from-dir", str(downloaded), "--passphrase", "pw",
+         "--output", str(tmp_path / "out"), "--extract"])
+
+    base = tmp_path / "out" / "Video-MME-v2"
+    for name, blob in files.items():
+        assert (base / name).read_bytes() == blob, name
+
+
+def test_pull_verifies_the_suffixed_manifest(tmp_path, fake_drive, capsys):
+    src = tmp_path / "Video-MME-v2"
+    make_dataset(src)
+    run(push_argv(src, work=tmp_path / "work",
+                  extra=("--part-suffix", ".pdf")))
+    downloaded = download_all(fake_drive, tmp_path / "downloaded")
+    capsys.readouterr()
+
+    victim = downloaded / "Video-MME-v2.part001.pdf"
+    victim.write_bytes(victim.read_bytes()[:-10] + b"CORRUPTED!")
+
+    with pytest.raises(SystemExit, match="sha256 mismatch"):
+        run(["pull", "--from-dir", str(downloaded), "--passphrase", "pw",
+             "--output", str(tmp_path / "out"), "--extract"])
+
+
+def test_changing_the_suffix_starts_a_fresh_stream(tmp_path, fake_drive, capsys):
+    src = tmp_path / "Video-MME-v2"
+    make_dataset(src)
+    work = tmp_path / "work"
+
+    run(push_argv(src, work=work, extra=("--part-suffix", ".pdf")))
+    capsys.readouterr()
+    run(push_argv(src, work=work, extra=("--part-suffix", ".bin")))
+    assert "starting a fresh stream" in capsys.readouterr().out
 
 
 def test_manifest_lists_every_part_with_its_digest(tmp_path, fake_drive):

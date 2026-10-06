@@ -395,6 +395,42 @@ def test_find_parts_refuses_an_empty_directory(tmp_path):
         stream.find_parts(tmp_path / "p")
 
 
+def test_part_name_appends_a_camouflage_suffix():
+    assert stream.part_name("Video-MME-v2", 7, ".pdf") == "Video-MME-v2.part007.pdf"
+    assert stream.part_name("Video-MME-v2", 7) == "Video-MME-v2.part007"
+
+
+def test_find_parts_reads_the_suffix_off_the_names(tmp_path):
+    d = write_parts(tmp_path / "p", ["a.part000.pdf", "a.part001.pdf"])
+    assert [p.name for p in stream.find_parts(d)] == [
+        "a.part000.pdf", "a.part001.pdf",
+    ]
+
+
+def test_find_parts_ignores_files_that_are_not_parts(tmp_path):
+    d = write_parts(tmp_path / "p", ["a.part000.pdf", "MANIFEST.sha256.pdf",
+                                     "notes.txt"])
+    assert [p.name for p in stream.find_parts(d)] == ["a.part000.pdf"]
+
+
+def test_find_parts_separates_pushes_that_differ_only_by_suffix(tmp_path):
+    d = write_parts(tmp_path / "p", ["a.part000", "a.part000.pdf"])
+    with pytest.raises(ValueError, match="2 different pushes"):
+        stream.find_parts(d)
+    assert [p.name for p in stream.find_parts(d, suffix=".pdf")] == ["a.part000.pdf"]
+    assert [p.name for p in stream.find_parts(d, suffix="")] == ["a.part000"]
+
+
+def test_encrypt_to_parts_applies_the_suffix(tmp_path):
+    out = tmp_path / "parts"
+    result = stream.encrypt_to_parts(
+        io.BytesIO(os.urandom(9000)), "pw", out, "p", 2048,
+        suffix=".pdf", delete_after=False,
+    )
+    assert [p.name for p in result.parts][0] == "p.part000.pdf"
+    assert sorted(f.name for f in out.iterdir()) == [p.name for p in result.parts]
+
+
 def test_find_parts_refuses_two_pushes_in_one_directory(tmp_path):
     """Concatenating parts from two cipher streams decrypts to nothing, so
     say so before the operator spends hours on it."""

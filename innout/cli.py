@@ -31,6 +31,19 @@ def _pick_source(args: argparse.Namespace) -> tuple[str, str]:
     raise ValueError("One of --url, --local, --github, or --hf must be provided")
 
 
+def _is_directory_source(source_type: str, source: str) -> bool:
+    """True when the source is a tree the streaming pipeline can tar.
+
+    A URL fetches a single file and a --local path may be one; there is
+    nothing to walk in either case.
+    """
+    if source_type in ("hf", "github"):
+        return True
+    if source_type == "local":
+        return Path(source).expanduser().is_dir()
+    return False
+
+
 def _fmt_bytes(n: int) -> str:
     for unit, scale in (("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024)):
         if n >= scale:
@@ -38,7 +51,9 @@ def _fmt_bytes(n: int) -> str:
     return f"{n} B"
 
 
-def cmd_stream_push(args: argparse.Namespace) -> None:
+def cmd_stream_push(
+    args: argparse.Namespace, source_type: str, source: str
+) -> None:
     """Push a directory source to Drive as encrypted parts, in one pass.
 
     The source is tarred, encrypted, and split straight into upload-sized
@@ -52,16 +67,13 @@ def cmd_stream_push(args: argparse.Namespace) -> None:
     """
     from innout import drive
 
-    if not args.drive:
-        raise SystemExit("error: --part-size requires --drive")
-
     part_size = stream.parse_size(args.part_size)
+    suffix = getattr(args, "part_suffix", None) or ""
     passphrase = get_passphrase(args.passphrase)
 
     work_dir = Path(args.work_dir).expanduser() if args.work_dir else Path(tempfile.mkdtemp())
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    source_type, source = _pick_source(args)
     print(f"Acquiring {source} into {work_dir} ...")
     src_dir = sources.acquire_dir(source_type, source, work_dir, repo_type=args.repo_type)
     prefix = args.part_prefix or src_dir.name
@@ -72,11 +84,23 @@ def cmd_stream_push(args: argparse.Namespace) -> None:
         f"Source: {src_dir}  {_fmt_bytes(source_bytes)}  "
         f"-> ~{expected_parts} parts of {_fmt_bytes(part_size)}"
     )
+    if suffix:
+        print(
+            f"Parts will be named {stream.part_name(prefix, 0, suffix)}, ... "
+            "-- a cosmetic suffix, not a second layer of protection."
+        )
 
     state_path = work_dir / f"{prefix}.push-state.json"
     state = stream.load_state(state_path)
-    if state and (state.get("part_size") != part_size or state.get("prefix") != prefix):
-        print("Part size or prefix changed since the last run; starting a fresh stream.")
+    if state and (
+        state.get("part_size") != part_size
+        or state.get("prefix") != prefix
+        or state.get("suffix", "") != suffix
+    ):
+        print(
+            "Part size, prefix or suffix changed since the last run; "
+            "starting a fresh stream."
+        )
         state = {}
 
     if state.get("salt"):
@@ -91,6 +115,7 @@ def cmd_stream_push(args: argparse.Namespace) -> None:
         stream.save_state(state_path, {
             "prefix": prefix,
             "part_size": part_size,
+            "suffix": suffix,
             "salt": salt.hex(),
             "nonce": nonce.hex(),
             "source": source,
@@ -138,7 +163,8 @@ def cmd_stream_push(args: argparse.Namespace) -> None:
     with stream.tar_stream(src_dir, excludes=args.exclude) as reader:
         result = stream.encrypt_to_parts(
             reader, passphrase, parts_dir, prefix, part_size,
-            salt=salt, nonce=nonce, on_part=on_part, skip_indices=skip,
+            suffix=suffix, salt=salt, nonce=nonce,
+            on_part=on_part, skip_indices=skip,
         )
 
     expected_total = crypto.HEADER_SIZE + result.plaintext_bytes + crypto.TAG_SIZE
@@ -148,10 +174,13 @@ def cmd_stream_push(args: argparse.Namespace) -> None:
             f"should be {expected_total}; refusing to publish a manifest"
         )
 
-    manifest = stream.write_manifest(result.parts, work_dir / "MANIFEST.sha256")
+    # The manifest wears the same suffix as the parts: a bare
+    # MANIFEST.sha256 sitting beside 55 .pdf files gives the game away.
+    manifest_name = f"MANIFEST.sha256{suffix}"
+    manifest = stream.write_manifest(result.parts, work_dir / manifest_name)
     drive.upload_one(
-        service, folder_id, manifest, "MANIFEST.sha256",
-        replace_id=(remote.get("MANIFEST.sha256") or {}).get("id"),
+        service, folder_id, manifest, manifest_name,
+        replace_id=(remote.get(manifest_name) or {}).get("id"),
     )
 
     print(
@@ -167,10 +196,15 @@ def cmd_push(args: argparse.Namespace) -> None:
     if not args.server and not args.drive:
         raise SystemExit("error: one of --server or --drive is required")
 
-    if getattr(args, "part_size", None):
-        return cmd_stream_push(args)
-
     source_type, source = _pick_source(args)
+
+    # A directory going to Drive always streams: it needs a quarter of the
+    # disk and has no size ceiling, so there is no reason to opt in.
+    # --part-size only picks how big each resulting file is. The old
+    # four-stage path still handles single files and the --server
+    # destination, neither of which has a tree to tar on the fly.
+    if args.drive and _is_directory_source(source_type, source):
+        return cmd_stream_push(args, source_type, source)
 
     passphrase = get_passphrase(args.passphrase)
     chunk_size_bytes = args.chunk_size * 1024 * 1024
@@ -232,18 +266,32 @@ def _pull_from_dir(
     """
     from_dir = Path(args.from_dir)
     try:
-        parts = stream.find_parts(from_dir, getattr(args, "part_prefix", None))
+        parts = stream.find_parts(
+            from_dir,
+            getattr(args, "part_prefix", None),
+            getattr(args, "part_suffix", None),
+        )
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
 
-    prefix = parts[0].name.rsplit(".part", 1)[0]
+    # Recover prefix and camouflage suffix from the names rather than
+    # making the operator remember what the push was disguised as.
+    match = stream.PART_RE.match(parts[0].name)
+    prefix, suffix = match["prefix"], match["suffix"]
     total = sum(p.stat().st_size for p in parts)
-    print(f"{len(parts)} part(s), {_fmt_bytes(total)}, prefix {prefix!r}")
+    print(
+        f"{len(parts)} part(s), {_fmt_bytes(total)}, prefix {prefix!r}"
+        + (f", suffix {suffix!r}" if suffix else "")
+    )
 
     manifest_path = getattr(args, "manifest", None)
     if manifest_path is None:
-        default = from_dir / "MANIFEST.sha256"
-        manifest_path = str(default) if default.exists() else None
+        for candidate in (
+            from_dir / f"MANIFEST.sha256{suffix}", from_dir / "MANIFEST.sha256"
+        ):
+            if candidate.exists():
+                manifest_path = str(candidate)
+                break
     if manifest_path:
         print(f"Verifying parts against {manifest_path} ...")
         try:
@@ -389,11 +437,12 @@ def build_parser() -> argparse.ArgumentParser:
     push_parser.add_argument(
         "--part-size",
         metavar="<size>",
-        default=None,
-        help="Switch to the single-pass streaming push and cap each Drive "
-             "file at this size, e.g. --part-size 1.8GiB. No stage is written "
-             "to disk at full size, so a 105 GB source needs ~107 GB free "
-             "instead of 420 GB. Resumable; requires --drive",
+        default="1.8GiB",
+        help="Maximum size of each file written to Drive (default: 1.8GiB). "
+             "Accepts 1.8GiB, 512MB, or a plain byte count. Applies to "
+             "directory sources pushed to --drive, which stream straight "
+             "into parts: no stage is written to disk at full size, so a "
+             "105 GB source needs ~107 GB free instead of 420 GB",
     )
     push_parser.add_argument(
         "--part-prefix",
@@ -401,6 +450,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Base name for the parts (default: the source directory name), "
              "giving <prefix>.part000, <prefix>.part001, ...",
+    )
+    push_parser.add_argument(
+        "--part-suffix",
+        metavar="<ext>",
+        default=None,
+        help="Extra suffix appended to every uploaded name, e.g. "
+             "--part-suffix .pdf gives <prefix>.part000.pdf. The manifest "
+             "takes the same suffix. Purely cosmetic -- the bytes are "
+             "AES-256-GCM regardless, and pull recovers the suffix on its own",
     )
     push_parser.add_argument(
         "--work-dir",
@@ -491,6 +549,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Pick one push out of a directory holding several, e.g. "
              "--part-prefix Video-MME-v2",
+    )
+    pull_parser.add_argument(
+        "--part-suffix",
+        metavar="<ext>",
+        default=None,
+        help="Only needed to disambiguate a directory holding several "
+             "pushes; the suffix is otherwise read off the part names",
     )
     pull_parser.set_defaults(func=cmd_pull)
 
